@@ -859,8 +859,10 @@ class ClientLifecycleMixin:
         if not official_host and not (current_key.startswith("sk-ant-") or getattr(self, "_is_anthropic_oauth", False)):
             return False
         try:
-            from agent.anthropic_credentials import resolve_anthropic_token
-            new_token = resolve_anthropic_token(model=self.model)
+            from agent.anthropic_credentials import refresh_selected_anthropic_token
+            new_token = refresh_selected_anthropic_token(
+                getattr(self, "_credential_pool", None), getattr(self, "_credential_pool_entry_id", None), model=self.model,
+            )
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False

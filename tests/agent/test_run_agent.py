@@ -5814,40 +5814,33 @@ class TestAnthropicBaseUrlPassthrough:
 
 class TestAnthropicCredentialRefresh:
     def test_try_refresh_anthropic_client_credentials_rebuilds_client(self):
+        old_token = "sk-ant-" + "oat01-public-old-fixture"
+        new_token = old_token + "-renewed"
         with (
             patch("model_tools.get_tool_definitions", return_value=_make_tool_defs("web_search")),
             patch("model_tools.check_toolset_requirements", return_value={}),
             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build,
         ):
-            old_client = MagicMock()
-            new_client = MagicMock()
+            old_client, new_client = MagicMock(), MagicMock()
             mock_build.side_effect = [old_client, new_client]
             agent = AIAgent(
-                api_key="sk-ant-oat01-stale-token",
-                base_url="https://openrouter.ai/api/v1",
-                api_mode="anthropic_messages",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
+                api_key=old_token, base_url="https://openrouter.ai/api/v1",
+                api_mode="anthropic_messages", quiet_mode=True,
+                skip_context_files=True, skip_memory=True,
             )
-
         agent._anthropic_client = old_client
-        agent._anthropic_api_key = "sk-ant-oat01-stale-token"
+        agent._anthropic_api_key = old_token
         agent._anthropic_base_url = "https://api.anthropic.com"
         agent.provider = "anthropic"
-
         with (
-            patch("agent.anthropic_credentials.resolve_anthropic_token", return_value="sk-ant-oat01-fresh-token"),
+            patch("agent.anthropic_credentials.refresh_selected_anthropic_token", return_value=new_token),
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=new_client) as rebuild,
         ):
             assert agent._try_refresh_anthropic_client_credentials() is True
-
         old_client.close.assert_called_once()
-        rebuild.assert_called_once_with(
-            "sk-ant-oat01-fresh-token", "https://api.anthropic.com", timeout=None,
-        )
+        rebuild.assert_called_once_with(new_token, "https://api.anthropic.com", timeout=None)
         assert agent._anthropic_client is new_client
-        assert agent._anthropic_api_key == "sk-ant-oat01-fresh-token"
+        assert agent._anthropic_api_key == new_token
 
 
     def test_anthropic_messages_create_preflights_refresh(self):
@@ -6801,45 +6794,26 @@ class TestNormalizeCodexDictArguments:
 
 
 class TestOAuthFlagAfterCredentialRefresh:
-    """_is_anthropic_oauth must update when token type changes during refresh."""
+    """Preflight without source binding must preserve the explicit credential."""
 
-    def test_oauth_flag_updates_api_key_to_oauth(self, agent):
-        """Refreshing from API key to OAuth token must set flag to True."""
+    @pytest.mark.parametrize("oauth", [False, True])
+    def test_unbound_token_type_is_not_replaced(self, agent, oauth):
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"
-        agent._anthropic_api_key = "sk-ant-api-old"
+        old = "sk-ant-" + "oat01-public-unbound-fixture" if oauth else "public-static-fixture"
+        agent._anthropic_api_key = old
         agent._anthropic_client = MagicMock()
-        agent._is_anthropic_oauth = False
+        agent._is_anthropic_oauth = oauth
+        agent._credential_pool = None
+        agent._credential_pool_entry_id = None
 
-        with (
-            patch("agent.anthropic_credentials.resolve_anthropic_token",
-                  return_value="sk-ant-setup-oauth-token"),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
-        ):
-            result = agent._try_refresh_anthropic_client_credentials()
+        with patch("agent.anthropic_credentials.resolve_anthropic_token") as discover:
+            assert agent._try_refresh_anthropic_client_credentials() is False
 
-        assert result is True
-        assert agent._is_anthropic_oauth is True
-
-    def test_oauth_flag_updates_oauth_to_api_key(self, agent):
-        """Refreshing from OAuth to API key must set flag to False."""
-        agent.api_mode = "anthropic_messages"
-        agent.provider = "anthropic"
-        agent._anthropic_api_key = "sk-ant-setup-old"
-        agent._anthropic_client = MagicMock()
-        agent._is_anthropic_oauth = True
-
-        with (
-            patch("agent.anthropic_credentials.resolve_anthropic_token",
-                  return_value="sk-ant-api03-new-key"),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
-        ):
-            result = agent._try_refresh_anthropic_client_credentials()
-
-        assert result is True
-        assert agent._is_anthropic_oauth is False
+        discover.assert_not_called()
+        agent._anthropic_client.close.assert_not_called()
+        assert agent._anthropic_api_key == old
+        assert agent._is_anthropic_oauth is oauth
 
 
 class TestFallbackSetsOAuthFlag:

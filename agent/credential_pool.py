@@ -1498,14 +1498,17 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         if self.provider not in _SINGLE_USE_REFRESH_PROVIDERS and plugin_refresh_hook(self.provider) is None:
             return self._refresh_entry_impl(entry, force=force, failed_key=failed_key)
 
-        # Single-use refresh tokens: sync -> POST -> write-back must be atomic
-        # across Hermes processes, or two processes adopt the same on-disk
-        # token, both POST it, and the loser gets ``refresh_token_reused`` /
-        # ``invalid_grant`` (for Anthropic sources other than claude_code
-        # there was no recovery path at all). Serialize through the shared
-        # cross-process auth-store flock; a waiter's in-lock re-sync picks up
-        # the winner's rotated token and skips the POST.
-        with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
+        from agent.anthropic_pool_refresh import current_row, refresh_owned_entry, store_lock
+        bound_anthropic = self.provider == "anthropic" and entry.id in self._persisted_token_pairs
+        if bound_anthropic and entry.source not in ("hermes_pkce", "claude_code"):
+            return refresh_owned_entry(self, entry, force=force)
+        # Singleton refresh keeps its existing serialization, but admission must
+        # validate presence/provenance under the actual owning auth-store lock.
+        lock = store_lock(self, entry) if bound_anthropic else _auth_store_lock(
+            timeout_seconds=self._single_use_refresh_lock_timeout())
+        with lock:
+            if bound_anthropic and current_row(self, entry) is None:
+                return None
             if self.provider == "openai-codex":
                 synced = self._sync_entry_from_auth_store(entry)
                 if synced is not entry and not force and not self._entry_needs_refresh(synced):
@@ -1532,13 +1535,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             return self._refresh_entry_impl(synced, force=force)
 
     def _claude_code_credentials_lock(self):
-        """Cross-process lock keyed to the shared claude_code credentials file.
-
-        Unlike the per-profile ``_auth_store_lock()`` this serializes every
-        profile and process that might refresh a ``claude_code`` entry.
+        """Serialize shared Claude Code credentials across profiles/processes.
         """
         from agent.anthropic_credentials import claude_code_credentials_path
-
         return _auth_store_lock(
             timeout_seconds=self._single_use_refresh_lock_timeout(),
             target_path=claude_code_credentials_path(),
@@ -1550,6 +1549,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         exc: BaseException,
         *,
         store: str,
+        persist: bool = True,
+        source_path: Optional[Path] = None,
     ) -> None:
         """Quarantine an entry whose rotated pair never reached its store.
 
@@ -1561,6 +1562,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         any row we persisted; the next refresh would replay the spent token.
         So never expose or persist the rotated pair; mark the entry terminally
         so it surfaces as an explicit re-auth requirement.
+
+        Pool-owned rotations pass their owning auth path and persist=False:
+        the same native verdict survives a failed auth write, while the caller
+        conditionally persists only the authoritative selected row.
         """
         logger.error(
             "Anthropic %s refresh rotated the single-use token but could not commit it "
@@ -1582,7 +1587,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             mark_rotation_consumed_uncommitted(
                 entry.access_token,
                 entry.refresh_token,
-                source_path=spent_rotation_source_path(entry.source),
+                source_path=source_path or spent_rotation_source_path(entry.source),
             )
         except Exception:  # pragma: no cover - never block the quarantine
             logger.debug("Failed to record consumed rotation fingerprints", exc_info=True)
@@ -1593,6 +1598,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 "reason": CREDENTIAL_PERSIST_FAILED_REASON,
                 "message": f"rotated credential was not durably written to {store}: {exc}",
             },
+            persist=persist,
         )
 
     def _single_use_refresh_lock_timeout(self) -> float:
@@ -1634,26 +1640,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 
     def _refresh_anthropic(self, entry: PooledCredential) -> PooledCredential:
         """POST the Anthropic refresh, commit to the singleton, return the rotated (unpersisted) entry."""
-        from agent.anthropic_credentials import (
-            is_rotation_consumed_uncommitted,
-            refresh_anthropic_oauth_pure,
-            spent_rotation_source_path,
-        )
+        from agent.anthropic_credentials import refresh_anthropic_oauth_pure
+        from agent.anthropic_pool_refresh import check_spent_rotation
 
-        # Never POST a refresh token another process already spent: the
-        # durable sidecar verdict is what a fresh interpreter sees here.
-        source_path = spent_rotation_source_path(entry.source)
-        if is_rotation_consumed_uncommitted(entry.refresh_token, source_path=source_path) or (
-            is_rotation_consumed_uncommitted(entry.access_token, source_path=source_path)
-        ):
-            raise _RefreshDone(self._fail_closed_unpersisted_rotation(
-                entry,
-                RuntimeError(
-                    "credential pair was rotated by another process but the "
-                    "rotation never committed (spent-rotation sidecar verdict)"
-                ),
-                store=str(source_path or "credential store"),
-            ))
+        check_spent_rotation(self, entry)
         refreshed = refresh_anthropic_oauth_pure(entry.refresh_token, use_json=entry.source.endswith("hermes_pkce"))
         updated = replace(
             entry,
@@ -1830,7 +1820,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         self._mark_exhausted(entry, None)
         return None
 
-    def _mark_dead_refresh_grant(self, entry: PooledCredential, exc: Exception) -> None:
+    def _mark_dead_refresh_grant(
+        self, entry: PooledCredential, exc: Exception, *, persist: bool = True,
+    ) -> None:
         """Mark a row whose refresh token was terminally rejected DEAD, if the quarantine kept it.
 
         ``_quarantine_sources`` drops only singleton-seeded rows; an independent ``manual:*`` login
@@ -1844,6 +1836,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 return
             self._adopt(
                 current,
+                persist=persist,
                 last_status=STATUS_DEAD,
                 last_status_at=time.time(),
                 last_error_code=None,
@@ -2074,6 +2067,13 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                         entries_to_prune.append(entry.id)  # can't mutate while iterating
                         cleared_any = True
                 continue
+            if (self.provider == "anthropic" and entry.auth_type == AUTH_TYPE_OAUTH
+                    and entry.source not in ("hermes_pkce", "claude_code")):
+                from agent.anthropic_pool_refresh import rotation_consumed
+                if rotation_consumed(self, entry):
+                    # Auth-store quarantine may itself have failed. Never lease
+                    # the consumed pair, even while its access token is unexpired.
+                    continue
             if model_cooldown_until(entry, model) is not None:
                 continue
             if entry.last_status == STATUS_EXHAUSTED:

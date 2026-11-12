@@ -61,7 +61,7 @@ class TestOAuthFlagOnRefresh:
         agent._is_anthropic_oauth = False
 
         with (
-            patch("agent.anthropic_credentials.resolve_anthropic_token",
+            patch("agent.anthropic_credentials.refresh_selected_anthropic_token",
                   return_value=_OAUTH_LIKE_TOKEN),
             patch("agent.anthropic_adapter.build_anthropic_client",
                   return_value=MagicMock()),
@@ -89,7 +89,7 @@ class TestOAuthFlagOnRefresh:
         agent._is_anthropic_oauth = False
 
         with (
-            patch("agent.anthropic_credentials.resolve_anthropic_token",
+            patch("agent.anthropic_credentials.refresh_selected_anthropic_token",
                   return_value=_OAUTH_LIKE_TOKEN),
             patch("agent.anthropic_adapter.build_anthropic_client",
                   return_value=MagicMock()),
@@ -117,7 +117,7 @@ class TestOAuthFlagOnRefresh:
         agent._primary_runtime = {"anthropic_api_key": old, "is_anthropic_oauth": False}
 
         with (
-            patch("agent.anthropic_credentials.resolve_anthropic_token", return_value=new),
+            patch("agent.anthropic_credentials.refresh_selected_anthropic_token", return_value=new),
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
         ):
             result = agent._try_refresh_anthropic_client_credentials()
@@ -148,7 +148,7 @@ class TestOAuthFlagOnRefresh:
             return [{"role": "user", "content": "[summary]"}, {"role": "assistant", "content": "tail"}]
 
         with (
-            patch("agent.anthropic_credentials.resolve_anthropic_token", return_value=new),
+            patch("agent.anthropic_credentials.refresh_selected_anthropic_token", return_value=new),
             patch.object(AIAgent, "_build_direct_anthropic_client", return_value=MagicMock()),
             patch.object(cc, "compress", side_effect=fake_compress),
             patch.object(agent, "_emit_status", side_effect=lambda _s: announced.append(agent._anthropic_api_key)),
@@ -186,7 +186,7 @@ class TestOAuthFlagOnRefresh:
         try:
             _publish_runtime_main(agent)
             with (
-                patch("agent.anthropic_credentials.resolve_anthropic_token", return_value=new),
+                patch("agent.anthropic_credentials.refresh_selected_anthropic_token", return_value=new),
                 patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
             ):
                 # The refresh runs in the request worker's copied Context; the turn thread reads after.

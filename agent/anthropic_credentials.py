@@ -697,6 +697,37 @@ def _available_anthropic_token(token: Optional[str], model: Optional[str]) -> Op
     return token
 
 
+def refresh_selected_anthropic_token(pool, credential_id: Optional[str], *, model: Optional[str] = None) -> Optional[str]:
+    """Renew only the bound entry, never rediscover a different account/source.
+
+    The stable pool id survives OAuth rotation; the pool cursor and ambient
+    credential precedence do not identify the credential a live client uses.
+    Missing/changed provenance is not permission to pick another credential.
+    """
+    if pool is None or pool.provider != "anthropic" or not credential_id:
+        return None
+    selected = next((entry for entry in pool.entries() if entry.id == credential_id), None)
+    if selected is None:
+        return None
+
+    from agent.credential_pool import load_pool
+    fresh = load_pool("anthropic")
+    available, _pending = fresh._available_entries(clear_expired=False, refresh=False, model=model)
+    entry = next((entry for entry in available if entry.id == credential_id), None)
+    if entry is None or (entry.source, entry.auth_type, entry.runtime_base_url) != (
+        selected.source, selected.auth_type, selected.runtime_base_url,
+    ):
+        return None
+    # Use the pool's expiry policy and locked sync -> refresh -> persist path,
+    # but never select()/refresh unrelated entries just to preflight this one.
+    if fresh._entry_needs_refresh(entry):
+        entry = fresh.try_refresh_matching(credential_id=credential_id)
+    if entry is not None:
+        from agent.anthropic_pool_refresh import sync_selected_entry
+        entry = sync_selected_entry(pool, selected, fresh, entry, model=model)
+    return entry.runtime_api_key if entry is not None else None
+
+
 def resolve_anthropic_token(*, model: Optional[str] = None) -> Optional[str]:
     """Resolve an Anthropic token from all sources in priority order (see module docstring).
 
