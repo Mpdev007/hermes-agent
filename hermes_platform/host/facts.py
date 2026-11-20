@@ -13,8 +13,6 @@ import sys
 import sysconfig
 from typing import NamedTuple
 
-from hermes_platform.host import darwin_pci
-
 _ARCH_NAMES = {
     "amd64": "amd64", "x86_64": "amd64", "x64": "amd64",
     "arm64": "arm64", "aarch64": "arm64",
@@ -327,6 +325,7 @@ def gpu_class() -> str:
         if sys.platform == "darwin":
             if native_arch() == "arm64":
                 return "apple_silicon"
+            from hermes_platform.host import darwin_pci
             vendors = darwin_pci.display_vendor_ids()
         elif sys.platform == "win32":
             adapters = _windows_display_adapters()

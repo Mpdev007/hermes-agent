@@ -8,12 +8,14 @@ Every ``mcp.servers.*``, ``mcp.catalog``, ``skills.manage`` and ``plugins.manage
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Literal
+
+from pydantic import Field, StrictBool
 
 from .base import JsonValue, Params, Result, WireEnum
 from .common import OpenModel, ProfileParams, SessionLiveInfo
 from .connectors_operation import CatalogAppState, CatalogTier
-from .registry import method
+from .registry import canonical_method, method
 
 
 class _SessionScoped(Params):
@@ -612,6 +614,58 @@ class PluginsListResult(Result):
 
 method("plugins.list", params=PluginsListParams, result=PluginsListResult,
        doc="Loaded plugin manager entries (legacy flat view); the Plugins Hub uses plugins.manage list.")
+
+
+class CanonicalPluginsListParams(Params):
+    # ``gateway/session_discovery.list_plugins``'s only key: ``true`` reads the loaded registry without
+    # initiating discovery or toolset loading; absent or ``false`` is the normal read. Strict like the
+    # handler (a string, number or null is refused, never coerced). The standalone wire keeps no key.
+    observe_only: StrictBool = False
+
+
+class PluginPolicyEvidenceRow(Result):
+    """One active final-policy registration in the answering process (``PluginLedgerMixin.policy_evidence``)."""
+
+    hook: str
+    policy_sha256: str
+    policy_fingerprint_kind: Literal["plugin_declared"]
+    callback_code_sha256: str
+
+
+class CanonicalPluginRow(Result):
+    name: str
+    key: str
+    version: str
+    source: str
+    enabled: bool
+    tools: int
+    hooks: int
+    commands: int
+    error: str
+    policy_evidence: list[PluginPolicyEvidenceRow]
+
+
+class PluginPolicyObservation(Result):
+    """Which gateway process answered (a process-bound observation), never a worker attestation."""
+
+    schema_: Literal["hermes.plugin-policy-observation/v1"] = Field(alias="schema")
+    pid: int
+    start_time: int | None
+    discovery_complete: bool
+    profile_id: str
+    workers_attested: bool
+
+
+class CanonicalPluginsListResult(Result):
+    plugins: list[CanonicalPluginRow]
+    policy_observation: PluginPolicyObservation
+    toolsets: list[PluginToolsetRow]
+    portable_mcp_servers: list[str]
+
+
+canonical_method("plugins.list", params=CanonicalPluginsListParams, result=CanonicalPluginsListResult,
+                 doc="The owner's profile-bound plugin rows with their active policy evidence and the answering "
+                     "process (``gateway/session_discovery.list_plugins``); ``observe_only`` never discovers.")
 
 
 class PluginsAction(WireEnum):

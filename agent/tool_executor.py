@@ -658,7 +658,7 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_body: dict[str, Any]
 
 def _pre_tool_block(agent, ref: _ToolCallRef):
     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
-    hook-modified args applied. Hook failures never block."""
+    hook-modified args applied. Policy delivery failures block."""
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
@@ -669,8 +669,9 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
             middleware_trace=list(ref.trace),
         )
         return block_msg, (ref.args if modified_args is None else modified_args)
-    except Exception:
-        return None, ref.args
+    except (Exception, SystemExit):
+        logger.exception("Pre-tool policy delivery failed; blocking the call")
+        return "BLOCKED: pre-tool policy delivery failed", ref.args
 
 
 def _dispatch_authorized_once(
@@ -722,6 +723,14 @@ def _dispatch_authorized_once(
                 "argument_paths": pruned_paths,
             }
             block_error_type = _PRUNED_TOOL_ARGUMENTS_ERROR
+
+    if block_body is None:
+        from hermes_cli.tool_dispatch_policy import final_tool_block
+        final_block = final_tool_block(ref.name, ref.args, **tool_hook_ids(agent, ref.task_id, ref.call_id),
+                                       middleware_trace=list(ref.trace))
+        if final_block is not None:
+            block_body = {"error": final_block}
+            block_error_type = "plugin_block"
 
     guardrail_decision = None
     if block_body is None:

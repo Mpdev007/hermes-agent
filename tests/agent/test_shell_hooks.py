@@ -754,7 +754,7 @@ def test_real_tool_hooks_receive_only_the_owning_workers_identity(tmp_path, monk
     from contextlib import nullcontext
     from types import SimpleNamespace
     from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
-    from agent.agent_runtime_helpers import _pre_tool_block_message
+    from agent.inline_tool_executors import _pre_tool_block_message
     from agent.inline_tool_executors import emit_terminal_post_tool_call
     from hermes_cli import plugins
 

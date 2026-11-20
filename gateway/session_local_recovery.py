@@ -176,6 +176,7 @@ def restore_local_session(authority, sid):
     try:
         # The catch-up writes, so the receipt as stored must already be this owner's (#140060).
         receipt, source, route, entry = owned_receipt(authority, sid)
+        restore_policy(receipt['policy'])  # refuse bypass before compression adoption can write a receipt
         chat_id, store = source.chat_id, authority.runner.session_store
         adopted = _with_untracked_compression(authority, sid, receipt)
         policy = restore_policy(adopted['policy'])

@@ -4802,6 +4802,43 @@ export interface CanonicalShellExecParams {
   command: string
   profile?: string | null
 }
+export interface CanonicalPluginsListParams {
+  observe_only?: boolean
+}
+export interface CanonicalPluginsListResult {
+  plugins: CanonicalPluginRow[]
+  policy_observation: PluginPolicyObservation
+  toolsets: PluginToolsetRow[]
+  portable_mcp_servers: string[]
+}
+export interface CanonicalPluginRow {
+  name: string
+  key: string
+  version: string
+  source: string
+  enabled: boolean
+  tools: number
+  hooks: number
+  commands: number
+  error: string
+  policy_evidence: PluginPolicyEvidenceRow[]
+}
+/** One active final-policy registration in the answering process (``PluginLedgerMixin.policy_evidence``). */
+export interface PluginPolicyEvidenceRow {
+  hook: string
+  policy_sha256: string
+  policy_fingerprint_kind: 'plugin_declared'
+  callback_code_sha256: string
+}
+/** Which gateway process answered (a process-bound observation), never a worker attestation. */
+export interface PluginPolicyObservation {
+  schema: 'hermes.plugin-policy-observation/v1'
+  pid: number
+  start_time: number | null
+  discovery_complete: boolean
+  profile_id: string
+  workers_attested: boolean
+}
 export interface PromptReceiptParams {
   session_id: string
   admission_id: string
@@ -7209,6 +7246,8 @@ export interface CanonicalRpcMethods {
   'image.attach_bytes': { params: ImageAttachBytesParams; result: CanonicalAttachedImageResult }
   /** Native-owner only: admit the dispatcher's current claim on a kanban task. */
   'kanban.run': { params: KanbanRunParams; result: KanbanRunResult }
+  /** The owner's profile-bound plugin rows with their active policy evidence and the answering process (``gateway/session_discovery.list_plugins``); ``observe_only`` never discovers. */
+  'plugins.list': { params: CanonicalPluginsListParams; result: CanonicalPluginsListResult }
   'profiles.list': { params: CanonicalProfilesParams; result: CanonicalProfilesResult }
   /** Retire a queued admission; a started one is interrupted in the same call. */
   'prompt.cancel': { params: PromptCancelParams; result: AdmissionStatus }
@@ -7286,6 +7325,7 @@ export const CANONICAL_RPC_METHODS = [
   'groups.retry',
   'image.attach_bytes',
   'kanban.run',
+  'plugins.list',
   'profiles.list',
   'prompt.cancel',
   'prompt.receipt',

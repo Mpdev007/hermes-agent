@@ -22,6 +22,7 @@ class _SafeWorkerPolicy:
     safe_mode: bool
     ignore_user_config: bool
     config_json: str
+    source: str | None = None
 
 
 _policy: _SafeWorkerPolicy | None = None
@@ -31,25 +32,43 @@ _RUNTIME_IMPORTS = frozenset({
     "hermes_cli.plugins", "providers", "agent.agent_init",
 })
 
+PROTECTED_SOURCES = frozenset({"acp", "a2a", "api_server", "cron", "oneshot", "webhook"})
+
+
+def bypass_field(source, safe_mode=False, ignore_user_config=False):
+    """Troubleshooting isolation cannot remove policy from explicitly protected scopes."""
+    if isinstance(source, str) and source in PROTECTED_SOURCES:
+        if safe_mode is True:
+            return "safe_mode"
+        if ignore_user_config is True:
+            return "ignore_user_config"
+    return None
+
+
+def validate_worker_bypass(source, safe_mode=False, ignore_user_config=False):
+    if field := bypass_field(source, safe_mode, ignore_user_config):
+        raise ValueError(f"protected source {source} refuses {field}")
+
 
 def _bind_safe_worker_policy(*, safe_mode: bool, ignore_user_config: bool,
-                             config: dict) -> _SafeWorkerPolicy:
+                             config: dict, source: str | None = None) -> _SafeWorkerPolicy:
     """Called by the private worker bootstrap, never by the owner or public CLI."""
     if type(safe_mode) is not bool or type(ignore_user_config) is not bool:
         raise TypeError("worker bypass policy fields must be booleans")
     if not (safe_mode or ignore_user_config):
         raise ValueError("ordinary execution binds its config with _bind_worker_config")
-    return _bind(safe_mode, True, config)
+    validate_worker_bypass(source, safe_mode, ignore_user_config)
+    return _bind(safe_mode, True, config, source)
 
 
-def _bind_worker_config(config: dict) -> _SafeWorkerPolicy:
+def _bind_worker_config(config: dict, *, source: str | None = None) -> _SafeWorkerPolicy:
     """An ordinary managed worker's frozen session config: every config reader returns it (the
     session never follows later profile edits), while plugins, MCP, hooks and providers load as
     usual — ``safe_worker_enabled()`` stays False. Same one-shot, pre-import rules as bypass."""
-    return _bind(False, False, config)
+    return _bind(False, False, config, source)
 
 
-def _bind(safe_mode: bool, ignore_user_config: bool, config: dict) -> _SafeWorkerPolicy:
+def _bind(safe_mode: bool, ignore_user_config: bool, config: dict, source: str | None = None) -> _SafeWorkerPolicy:
     global _policy
     if type(config) is not dict:
         raise TypeError("worker config must be a JSON object")
@@ -59,7 +78,7 @@ def _bind(safe_mode: bool, ignore_user_config: bool, config: dict) -> _SafeWorke
             raise RuntimeError("worker policy is already bound")
         if _RUNTIME_IMPORTS.intersection(sys.modules):
             raise RuntimeError("worker policy must bind before runtime imports")
-        _policy = _SafeWorkerPolicy(os.getpid(), safe_mode, ignore_user_config, serialized)
+        _policy = _SafeWorkerPolicy(os.getpid(), safe_mode, ignore_user_config, serialized, source)
         return _policy
 
 
@@ -78,3 +97,13 @@ def worker_config_snapshot() -> dict | None:
     """Return detached explicit config; None means the ordinary loader owns it."""
     policy = _current_policy()
     return json.loads(policy.config_json) if policy is not None else None
+
+
+def worker_source() -> str | None:
+    policy = _current_policy()
+    return policy.source if policy is not None else None
+
+
+def worker_bypass_enabled() -> bool:
+    policy = _current_policy()
+    return policy is not None and (policy.safe_mode or policy.ignore_user_config)

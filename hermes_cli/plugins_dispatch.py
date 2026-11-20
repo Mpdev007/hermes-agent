@@ -57,7 +57,7 @@ _HOOK_CALL_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: set[str] = {"pre_tool_call", "pre_tool_dispatch"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
@@ -65,6 +65,11 @@ _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 # Live workers a hung callback may accumulate before it is skipped outright (#105223 / #98382).
 _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
+
+
+def _policy_timeout_message(hook_name: str) -> str:
+    return (_PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE if hook_name == "pre_tool_call"
+            else f"{hook_name} plugin callback timed out or is still running")
 
 # The one hook whose callback rewrites the reply the user would otherwise see streaming.
 STREAM_HOLDING_HOOK = "transform_llm_output"
@@ -293,7 +298,7 @@ class PluginDispatchMixin:
         return self._run_hook_callbacks(hook_name, self._hooks.get(hook_name, []), kwargs)
 
     def _run_hook_callbacks(self, hook_name: str, callbacks: Any, kwargs: dict[str, Any],
-                            failed: Optional[list] = None) -> list[Any]:
+                            failed: Optional[list] = None, called: Optional[list] = None) -> list[Any]:
         """:meth:`invoke_hook`'s loop over ``callbacks``; each one that raised or timed out is
         appended to ``failed`` when given."""
         from hermes_cli.plugins import _resolve_hook_callback_timeout
@@ -309,10 +314,12 @@ class PluginDispatchMixin:
                         if failed is not None:
                             failed.append(cb)
                         if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                            results.append({"action": "block", "message": _policy_timeout_message(hook_name)})
                         continue
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
+                if called is not None:
+                    called.append(cb)
                 if ret is not None:
                     results.append(ret)
             except (Exception, SystemExit) as exc:  # health: allow BLE001 -- moved from invoke_hook: plugin callbacks are untrusted; each failure is reported and isolated
@@ -564,13 +571,21 @@ class PluginDispatchMixin:
             return False
         return bool(self._hooks.get(hook_name))
 
-    def track_hook(self, context: Any, hook_name: str, callback: Callable, *, hold_stream: bool = False):
+    def track_hook(self, context: Any, hook_name: str, callback: Callable, *, hold_stream: bool = False,
+                   policy_fingerprint: str | None = None):
         """Register ``callback`` for ``hook_name`` on behalf of ``context`` (unknown names warn but are
         still stored). ``hold_stream=True`` on ``transform_llm_output`` declares the rewrite must reach
         the user first, so this profile's replies are not streamed (:meth:`holds_stream`)."""
         from hermes_cli.plugins import VALID_HOOKS
 
+        if policy_fingerprint is not None and not re.fullmatch(r"[0-9a-f]{64}", policy_fingerprint):
+            raise ValueError("policy_fingerprint must be a SHA256 hex digest")
         handle = context._track_callback("hook", hook_name, callback, self._hooks, VALID_HOOKS)
+        handle.callback = callback
+        handle.policy_fingerprint = policy_fingerprint
+        if policy_fingerprint is not None:
+            from hermes_cli.tool_dispatch_policy import callback_code_fingerprint
+            handle.callback_code_fingerprint = callback_code_fingerprint(callback)
         if hold_stream and hook_name != STREAM_HOLDING_HOOK:
             logger.warning("Plugin '%s' set hold_stream on '%s'; only %s rewrites the reply, ignored",
                            context.manifest.name, hook_name, STREAM_HOLDING_HOOK)
@@ -639,7 +654,7 @@ class PluginDispatchMixin:
             except TimeoutError:
                 logger.warning("Hook '%s' callback %s timed out after %.0fs", hook_name, callback_name, timeout)
                 if fail_closed:  # policy hook: fail closed with a block directive
-                    results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                    results.append({"action": "block", "message": _policy_timeout_message(hook_name)})
             except (Exception, SystemExit) as exc:
                 # Same isolation + failure contract as the sync path (#111922 warn-once, #109624
                 # a raising policy guard fails closed).

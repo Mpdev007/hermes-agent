@@ -393,7 +393,7 @@ def register(ctx):
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility.
 - Callback exceptions are logged and skipped; later callbacks continue. A callback that fails the same way on every call (typically a signature naming a field the hook does not send, e.g. `tool_data` instead of `tool_name`/`args`) is reported **once** at WARNING — the message lists the fields the hook provides — and identical repeats go to DEBUG, so a mis-declared plugin cannot flood the log.
-- If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus the policy hook `pre_tool_call`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out or still-running `pre_tool_call` callbacks **fail closed** (block the tool); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
+- If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus `pre_tool_call` and `pre_tool_dispatch`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out or still-running policy callbacks **fail closed** (block the tool); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
 - The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement, and **directive/control** hooks consume documented return shapes. Plugin middleware is a separate registry and surface, not another hook category.
 - Correlation fields such as `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are hook-specific and may be absent. Treat IDs as opaque.
 - Tool hooks also carry `conversation_id`: the conversation's first session id, which stays the same when a rotating compression replaces `session_id`, and which a delegated subagent shares with its delegator. Key per-conversation state on it.
@@ -629,6 +629,121 @@ def register(ctx):
 ```
 
 ---
+
+### `pre_tool_dispatch`
+
+Python-only final policy validation, after argument modifications and immediately before
+the inline, connector or registry handler. A deferred `tool_call` is also checked under
+its resolved underlying name and arguments. The admission/approval `pre_tool_call`
+callbacks still fire once; this final validator can run at both an envelope boundary
+and its resolved handler, so it must be read-only and safe to repeat.
+
+The signature and identity fields match `pre_tool_call`. Return `None` to allow, or
+`{"action": "block", "message": "nonempty reason"}` to veto. Other directives,
+malformed delivery, argument mutation, exceptions and timeouts block execution.
+Callbacks receive a deep copy, never the handler's mutable arguments. Final
+validation cannot grant approval or rewrite the tool. Shell hooks are unsupported
+because their optional fail-open semantics cannot supply this contract.
+
+`ctx.register_hook(..., policy_fingerprint=<SHA256 hex digest>)` may attach a
+non-secret declared identity for its policy configuration snapshot. Hermes records that identity
+and a digest of the registered Python callback's code object in its ownership
+ledger. These are observations of registered code/table identities; they do not
+attest transitive helper code, downstream side effects or a hostile in-process plugin.
+The callback digest depends on the interpreter and compile filename.
+
+The fingerprint is a plugin declaration: it is not derived by the host from the
+callback's bound data. A captured table can be independent of the plugin's old
+module-global table without being immutable against hostile in-process code.
+For example, partial-bound arguments and a global lane reader can be replaced.
+
+The authenticated, profile-bound native `plugins.list` RPC accepts
+`{"observe_only": true}` to read those active registrations without initiating
+plugin discovery or toolset loading. Its `policy_observation` includes the serving
+PID, process start time, profile and `discovery_complete`. Qualification requires
+`discovery_complete: true`; retained rows after suppressed or failed discovery do
+not qualify. Each row includes its native discovery `source`. `workers_attested` is false: this is the
+gateway's registry, not a snapshot of separate managed workers. Compare that tuple with native control
+identity, then require the expected plugin/version, no load error and both policy
+registrations with the expected table identity. Empty evidence is not qualification.
+This is a registration snapshot, not proof that a real call delivered its policy;
+a separately authorized controlled call and independent result check are still needed.
+The observation's discovery-lock wait is bounded to one second; a refusal or any
+client-side timeout is unqualified. Default `plugins.list` behavior remains
+unchanged and can initiate discovery. A gateway snapshot cannot substitute for
+missing or mismatched worker-process evidence.
+
+#### Required policies on protected sources (candidate extension)
+
+Core selects `acp`, `a2a`, `api_server`, `cron`, `oneshot` and `webhook` from the native
+session/worker policy or native turn context, never a tool argument. Each must
+have a nonempty list of explicit plugin key/source pins in its owning profile configuration (the owner
+refreshes these declarations into a managed worker's bootstrap snapshot):
+
+```yaml
+plugins:
+  required_tool_policies:
+    acp: [{key: my-read-policy, source: user}]
+    a2a: [{key: my-read-policy, source: user}]
+    api_server: [{key: my-read-policy, source: user}]
+    cron: [{key: my-read-policy, source: user}]
+    oneshot: [{key: my-read-policy, source: user}]
+    webhook: [{key: my-read-policy, source: user}]
+```
+
+The declaration survives that plugin's absence. Missing/disabled/failed loading,
+an unfinished discovery, no owned active final callback, failure to complete the
+required callback, or its removal during delivery all veto the handler. A
+required callback that actually completes with None allows; no callback does
+not. A declared fingerprint is not used to establish this delivery. Plugin
+programmatic `ctx.dispatch_tool` uses the same final gate and checks its manager
+profile against the protected context.
+
+`source` is the native scanner's origin (`bundled`, `user`, `project` or
+`entrypoint`), not the plugin's declaration. A same-key project or pip plugin
+cannot satisfy a `source: user` pin. Key-only lists are refused, not migrated.
+This pins the origin class, not all code or policy data at that origin. The
+owner must still review and pin the host/plugin/config file tuple for rollout;
+native callback-code hashes are process observations, not a transitive trust root.
+Project overrides can execute during normal discovery before this delivery check;
+this does not contain hostile in-process code or an attacker controlling that home.
+
+Required delivery waits at most 0.25 seconds for each discovery-lock acquisition
+(before and after callbacks). Exhaustion still vetoes; the wait does not bound
+callback time, guarantee fairness or make an overloaded gateway available. A direct
+`ctx.dispatch_tool` call receives a new native tool-call ID so concurrent direct
+calls do not share a timeout gate. Callback-wide backoff after a real timeout remains.
+
+Core supplies its selected `protected_source` to required final callbacks. The
+coupled guard refuses a conflicting attended/legacy lane rather than allowing a
+legacy environment label to downgrade a protected source. Other required policies
+must likewise implement and be reviewed against their intended scope semantics.
+
+An old session's saved launch configuration cannot remove or supply the current
+profile's security declaration. Ordinary managed-worker admission refreshes just
+that declaration alongside approval state; it does not rewrite the saved session
+or refresh its unrelated tools/providers. Bypass troubleshooting retains its
+config-free path. A worker's bootstrap remains a snapshot for its lifetime;
+live, atomic policy revocation across workers is not claimed here.
+
+True `safe_mode` or `ignore_user_config` is refused for protected sources at
+admission, persisted policy restore and managed-worker bootstrap. A stored bypass
+session is refused before compression adoption or worker startup; its identity
+is not rewritten and its work is not replayed. A protected worker without the
+matching active session context is refused. Ordinary attended CLI/TUI safe-mode
+troubleshooting remains available.
+
+Compatibility: on this host build, EVERY profile using any protected source
+needs its own declaration and loaded policy, including `hermes chat -q`
+(`oneshot`). Missing configuration stops tool dispatch even if the optional
+hook used to allow an empty registry. There is no per-profile opt-out. Stage and
+roll back host build, guard and declarations as one coupled tuple for all served
+and CLI/scheduled profiles; a new profile is not automatically qualified.
+Attended CLI/TUI troubleshooting keeps its existing behavior. Other source labels are outside this
+explicit contract. It does not attest hostile in-process code, handler side
+effects or live workers. The owner must configure and independently review the
+coupled host/policy candidate before activation; stock Hermes releases do not include
+this extension. Matching disk files are not current-process proof.
 
 ### `post_tool_call`
 

@@ -101,6 +101,10 @@ def _runner_scratch_root() -> str:
     later makedirs/mkdtemp here fail with EPERM for every other user on the host, with no way
     back that does not need root. Keying by uid means no run is blocked by another's leftovers.
     """
+    if "tests.offline_policy_fence" in sys.argv:
+        root = Path(os.environ["TMPDIR"]) / "per-file"
+        root.mkdir(exist_ok=True)
+        return str(root)
     name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
     if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
         root = os.path.join(tempfile.gettempdir(), name)
@@ -687,7 +691,10 @@ def _run_one_file_once(
 
         output +=  "\n"
     finally:
-        _kill_detached_leftovers(temproot)
+        # The explicit policy fence refuses every child-process spawn before execution.
+        # There can be no detached children; do not inspect unrelated host environments.
+        if "tests.offline_policy_fence" not in pytest_args:
+            _kill_detached_leftovers(temproot)
         # Delete the temp root for this attempt. Nothing reads it after the
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite. Permission fixtures leave read-only dirs
@@ -1086,11 +1093,17 @@ def _pytest_flag_error(tokens: list[str]) -> Optional[str]:
     if the parser cannot be built is the check skipped and tokens forwarded
     as before.
     """
+    # Only the fenced child may import pytest for this explicit lane. Typos
+    # remain errors there; the parent must not load pytest entry points first.
+    if "tests.offline_policy_fence" in tokens:
+        return None
     try:
         from _pytest.config import UsageError, get_config
 
         config = get_config()
-        config.pluginmanager.load_setuptools_entrypoints("pytest11")
+        if ("--disable-plugin-autoload" not in tokens
+                and os.environ.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD") != "1"):
+            config.pluginmanager.load_setuptools_entrypoints("pytest11")
         parser = config._parser.optparser
     except Exception:
         return None
@@ -1242,6 +1255,12 @@ def _summary_notes(
         if collect:
             notes += f" ({collect} at import/collection)"
     return notes
+
+
+def _sweep_unfenced_runner_roots(pytest_args: list[str]) -> None:
+    """Only the normal lane owns historical process-root maintenance."""
+    if "tests.offline_policy_fence" not in pytest_args:
+        _sweep_killed_run_roots(_runner_scratch_root())
 
 
 def main() -> int:
@@ -1627,7 +1646,7 @@ def main() -> int:
 
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    _sweep_killed_run_roots(_runner_scratch_root())
+    _sweep_unfenced_runner_roots(pytest_passthrough)
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         # Duration cache for the timeout scaler: known-slow files get

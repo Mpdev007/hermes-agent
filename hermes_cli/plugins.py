@@ -111,7 +111,7 @@ _install_plugin_debug_handler()
 # The function that fires each name is listed in website/docs/developer-guide/plugins/index.md
 # ("Where each hook fires"); add a row there when you add a hook.
 VALID_HOOKS: set[str] = {
-    "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
+    "pre_tool_call", "pre_tool_dispatch", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
     "transform_llm_output", "pre_llm_call", "post_llm_call",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
@@ -214,7 +214,7 @@ VALID_HOOKS: set[str] = {
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: set[str] = {"transform_api_error_classification"}
+SHELL_UNSUPPORTED_HOOKS: set[str] = {"transform_api_error_classification", "pre_tool_dispatch"}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 
@@ -275,6 +275,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self.home_path = Path(self.scope_key)
         self._discovery_lock = threading.RLock()
         self._discovered: bool = False
+        self._discovery_complete: bool = False
         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and
         # the installed scope may then hold plugin-supplied names, and a later discovery that finds NO
         # enabled plugin source (plugin removed / disabled) must still reconcile once to drop them.
@@ -410,6 +411,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             # ``on_plugin_loaded`` reports the plugins this sweep loads that the process did not have before
             # (boot: everything; a mid-run install/enable: just the newcomer), keyed on the pre-sweep set.
             loaded_before = frozenset(k for k, p in self._plugins.items() if not p.error and not p.deferred)
+            self._discovery_complete = False
             if force:
                 self.unload()  # the ledger owns teardown of process-global registries
             if env_var_enabled("HERMES_SAFE_MODE"):
@@ -441,8 +443,10 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
                     # process that never imported providers has nothing stale to reload.
                     if (providers := sys.modules.get("providers")) is not None:
                         providers.refresh_bound_home()
+                self._discovery_complete = True
             except BaseException:
                 self._discovered = False
+                self._discovery_complete = False
                 raise
         # Outside the lock: a listener (the gateway's re-wire) may read the registry from another thread.
         self._notify_plugin_loaded(loaded_before)
@@ -653,15 +657,17 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
 
     def list_plugins(self) -> list[dict[str, Any]]:
         """Return a list of info dicts for all discovered plugins."""
-        return [
-            {
-                "name": p.manifest.name, "key": manifest_key(p.manifest), "kind": p.manifest.kind,
-                "version": p.manifest.version, "description": p.manifest.description,
-                "source": p.manifest.source, "enabled": p.enabled, "tools": len(p.tools_registered),
-                "hooks": len(p.hooks_registered), "middleware": len(p.middleware_registered),
-                "commands": len(p.commands_registered), "error": p.error,
-            } for _key, p in sorted(self._plugins.items())
-        ]
+        with self._discovery_lock:
+            return [
+                {
+                    "name": p.manifest.name, "key": manifest_key(p.manifest), "kind": p.manifest.kind,
+                    "version": p.manifest.version, "description": p.manifest.description,
+                    "source": p.manifest.source, "enabled": p.enabled, "tools": len(p.tools_registered),
+                    "hooks": len(p.hooks_registered), "middleware": len(p.middleware_registered),
+                    "commands": len(p.commands_registered), "error": p.error,
+                    "policy_evidence": self.policy_evidence(manifest_key(p.manifest)),
+                } for _key, p in sorted(self._plugins.items())
+            ]
 
     def find_plugin_skill(self, qualified_name: str) -> Optional[Path]:
         """Return the ``Path`` to a plugin skill's SKILL.md, or ``None``."""
@@ -1001,9 +1007,9 @@ def _delivery_manager() -> PluginManager:
 def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """Invoke a lifecycle hook (lazy-discovers first); return non-``None`` callback results.
 
-    Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and the policy hook ``pre_tool_call`` are
+    Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and the policy hooks are
     bounded by ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker is abandoned (not
-    joined) so we do not reintroduce the #6622 hang. Timed-out or still-running ``pre_tool_call`` callbacks
+    joined) so we do not reintroduce the #6622 hang. Timed-out or still-running policy callbacks
     fail closed with a block directive; other bounded hooks fail open (skip).
     Ensures plugins are discovered on first invocation so callers in processes that never explicitly call
     ``discover_plugins()`` (gateway platform events, TUI slash workers, query mode, cron) still fire

@@ -24,8 +24,6 @@ except ImportError:
 from pathlib import Path
 from typing import Callable
 
-import psutil
-
 from hermes_constants import get_hermes_home
 from tools.environments.base import _file_mtime_key
 from utils import mtime_is_racy
@@ -92,6 +90,9 @@ def _temp_entry_owner_alive(name: str) -> bool:
     pid_part = name[len(_SYNC_BACK_TEMP_PREFIX):].split("-", 1)[0]
     if not pid_part.isdigit():
         return True
+    # Process telemetry is needed only for a stale-owner probe, not to import
+    # the remote-backend helpers used by otherwise unrelated tool dispatch.
+    import psutil
     return psutil.pid_exists(int(pid_part))
 
 

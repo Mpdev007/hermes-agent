@@ -96,8 +96,9 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
 
 
 def _worker_config(authority, policy):
-    """The frozen session config the child binds as its only config (``bind_worker_policy``).
-    ``command_allowlist`` is approval state rather than launch policy: an ``always`` grant an
+    """The session config the child binds (``bind_worker_policy``). Required tool-policy
+    declarations and ``command_allowlist`` are current owner security state, not launch picks:
+    an ``always`` grant an
     earlier worker of an ordinary session persisted, or one the operator removed by hand, comes
     from the live profile file, as it did before the child's config was frozen. Bypass sessions
     never read the profile."""
@@ -107,6 +108,8 @@ def _worker_config(authority, policy):
         return config
     from gateway.run import _load_gateway_config
     live = _load_gateway_config(home / 'config.yaml')
+    from gateway.session_policy_protection import refresh_required_tool_policies
+    refresh_required_tool_policies(config, live)
     config.pop('command_allowlist', None)
     if live.get('command_allowlist') is not None:
         config['command_allowlist'] = live['command_allowlist']
@@ -685,6 +688,8 @@ async def _finalize_managed_refusal(authority, session_id, accepted):
 
 
 async def execute_managed(authority, ref, row, policy):
+    from gateway.session_policy_protection import validate_protected_bypass
+    validate_protected_bypass(policy.source, policy.safe_mode, policy.ignore_user_config)
     from gateway.run_turn_progress import publish_worker_tool_event
     # This route never passes the inbound prepare step, so the worker would read ``@`` tokens as typed.
     from gateway.session_context_refs import managed_turn_text, refused_turn_result

@@ -38,7 +38,7 @@ class TestHandleFunctionCall:
         with (
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
             patch("hermes_cli.plugins.has_hook", return_value=True),
-            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]) as mock_invoke_hook,
         ):
             handle_function_call("web_search", {"q": "test"}, task_id="t1")
 
@@ -62,7 +62,7 @@ class TestHandleFunctionCall:
         with (
             patch("model_tools.registry.dispatch", return_value=result),
             patch("hermes_cli.plugins.has_hook", return_value=True),
-            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]) as mock_invoke_hook,
         ):
             assert handle_function_call("terminal", {"command": "false"}) == result
 

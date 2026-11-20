@@ -43,6 +43,10 @@ class PluginRegistration:
     # A ``transform_llm_output`` registration that must see the reply before the user does
     # (``register_hook(..., hold_stream=True)``; read by ``PluginDispatchMixin.holds_stream``).
     hold_stream: bool = False
+    # Optional non-secret policy/table identity, captured when the callback is registered.
+    policy_fingerprint: Optional[str] = None
+    callback_code_fingerprint: Optional[str] = None
+    callback: Optional[Callable] = None
     # Staged change applied only once the plugin's load succeeded (``_publish_staged_registrations``); a failed
     # or timed-out load disposes the handle first, so the change is never applied.
     publish: Optional[Callable[[], Any]] = None
@@ -67,6 +71,15 @@ class PluginRegistration:
 
 
 class PluginLedgerMixin:
+    def policy_evidence(self, plugin_key: str) -> list[dict[str, str]]:
+        """Describe this process's active policy registrations without invoking user callbacks."""
+        with self._discovery_lock:
+            return [{"hook": r.key, "policy_sha256": r.policy_fingerprint,
+                     "policy_fingerprint_kind": "plugin_declared",
+                     "callback_code_sha256": r.callback_code_fingerprint or ""}
+                    for r in self._ownership_ledger.get(plugin_key, [])
+                    if r.active and r.kind == "hook" and r.policy_fingerprint]
+
     def _track_registration(
         self, manifest: PluginManifest, kind: str, key: str, release: Callable[[], None], *,
         persistent: bool = False,
@@ -263,6 +276,7 @@ class PluginLedgerMixin:
         identity-conditional inverses. Returns ``True`` when anything was found."""
         unload_all = plugin is None
         if unload_all:
+            self._discovery_complete = False
             target_keys = set(self._ownership_ledger) | set(self._plugins)
             registrations = list(self._registration_order)
         else:

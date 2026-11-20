@@ -319,9 +319,12 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
     from gateway.run import _resolve_gateway_model
     from dataclasses import replace
     private_secrets = dict(trusted_secrets or {})
+    from gateway.session_policy_protection import validate_protected_bypass
+    validate_protected_bypass(params.get('source', 'cli'), params.get('safe_mode'), params.get('ignore_user_config'))
     client_key = params.get('api_key')  # the client's own; an alias's key is the owner's expansion
     if trusted_policy is not None:
         policy = trusted_policy
+        validate_protected_bypass(policy.source, policy.safe_mode, policy.ignore_user_config)
     elif any(params.get(name) is True for name in BYPASS_FIELDS):
         policy = _bypass_policy(params, private_secrets=private_secrets, client_local=client_local)
     else:

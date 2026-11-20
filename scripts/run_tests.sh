@@ -37,6 +37,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Explicit policy-fixture lane: enter BEFORE activation, pytest imports, host
+# plugin lookup or compileall. A missing prerequisite is an error, never setup.
+for _arg in "$@"; do
+  if [ "$_arg" = "tests.offline_policy_fence" ]; then
+    if [ "${__HERMES_TESTS_REEXEC:-}" != 1 ] || [ -z "${HERMES_PYTHON:-}" ] || [ ! -x "$HERMES_PYTHON" ]; then
+      echo "error: offline policy lane requires an existing HERMES_PYTHON and __HERMES_TESTS_REEXEC=1; no provisioning" >&2
+      exit 2
+    fi
+    exec "$HERMES_PYTHON" -I -S -B "$SCRIPT_DIR/run_tests_offline.py" "$@"
+  fi
+done
+
 # ── Locate python ───────────────────────────────────────────────────────────
 # The suite runs under the checkout's isolated test environment (pm.testenv),
 # and only there: unless the inherited environment is current for this

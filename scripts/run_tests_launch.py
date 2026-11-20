@@ -148,7 +148,8 @@ def start_pytest(
     The group is None on Windows, where the runner kills the tree another way.
     *scratch_dir* holds a forked child's output file until the runner reads it.
     """
-    server = _fork_server_for_run(repo_root)
+    fenced = "tests.offline_policy_fence" in pytest_args
+    server = None if fenced else _fork_server_for_run(repo_root)
     # The first files copied os.environ before the knob was popped; no test sees it.
     env.pop("HERMES_TEST_FORKSERVER", None)
     if server is not None:
@@ -157,8 +158,16 @@ def start_pytest(
         # getpgid here: until setsid runs it reports the fork server's group,
         # which is the runner's own.
         return proc, proc.pid
+    if fenced:
+        home = Path(env["PYTEST_DEBUG_TEMPROOT"]) / "home"
+        hermes = home / ".hermes"
+        hermes.mkdir(parents=True)
+        env.update(HOME=str(home), HERMES_HOME=str(hermes), __HERMES_TESTS_REEXEC="1")
+    command = ([sys.executable, "-I", "-S", "-B", str(repo_root / "scripts/run_tests_offline.py"),
+                "--child", str(file), *pytest_args] if fenced else
+               [sys.executable, "-m", "pytest", str(file), *pytest_args])
     proc = subprocess.Popen(
-        [sys.executable, "-m", "pytest", str(file), *pytest_args],
+        command,
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

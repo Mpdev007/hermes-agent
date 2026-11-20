@@ -486,6 +486,14 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
         """Dispatch a tool call through the registry with the parent agent (when available)
         resolved automatically; returns the handler's JSON string. ``kwargs`` forward to dispatch."""
         from tools.registry import registry
+        from hermes_cli.tool_dispatch_policy import final_tool_block
+        from uuid import uuid4
+        # Direct calls have no model tool-call ID. Give each invocation its own
+        # timeout-gate identity; a concurrent call is never a duplicate of this one.
+        if block := final_tool_block(tool_name, args, expected_profile=self._manager.scope_key,
+                                     tool_call_id="plugin:" + uuid4().hex):
+            import json
+            return json.dumps({"error": block})
         # In gateway mode _cli_ref is None — tools degrade gracefully (no spinner, TERMINAL_CWD).
         if "parent_agent" not in kwargs:
             agent = getattr(self._manager._cli_ref, "agent", None)
@@ -750,9 +758,11 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
                 _facade().logger.warning("Plugin '%s' locale file %s skipped: %s", self.manifest.name, file, exc)
         return handles
 
-    def register_hook(self, hook_name: str, callback: Callable, *, hold_stream: bool = False) -> PluginRegistration:
+    def register_hook(self, hook_name: str, callback: Callable, *, hold_stream: bool = False,
+                      policy_fingerprint: str | None = None) -> PluginRegistration:
         """Register a lifecycle hook callback (``PluginDispatchMixin.track_hook``)."""
-        return self._manager.track_hook(self, hook_name, callback, hold_stream=hold_stream)
+        return self._manager.track_hook(self, hook_name, callback, hold_stream=hold_stream,
+                                        policy_fingerprint=policy_fingerprint)
 
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
         """Register behavior-changing middleware (request kinds rewrite the payload, execution kinds

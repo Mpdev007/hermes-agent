@@ -9710,6 +9710,117 @@
         "title": "CanonicalPendingPrompt",
         "type": "object"
       },
+      "CanonicalPluginRow": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "tools": {
+            "title": "Tools",
+            "type": "integer"
+          },
+          "hooks": {
+            "title": "Hooks",
+            "type": "integer"
+          },
+          "commands": {
+            "title": "Commands",
+            "type": "integer"
+          },
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "policy_evidence": {
+            "items": {
+              "$ref": "#/components/schemas/PluginPolicyEvidenceRow"
+            },
+            "title": "Policy Evidence",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "key",
+          "version",
+          "source",
+          "enabled",
+          "tools",
+          "hooks",
+          "commands",
+          "error",
+          "policy_evidence"
+        ],
+        "title": "CanonicalPluginRow",
+        "type": "object"
+      },
+      "CanonicalPluginsListParams": {
+        "additionalProperties": false,
+        "properties": {
+          "observe_only": {
+            "default": false,
+            "title": "Observe Only",
+            "type": "boolean"
+          }
+        },
+        "title": "CanonicalPluginsListParams",
+        "type": "object"
+      },
+      "CanonicalPluginsListResult": {
+        "additionalProperties": false,
+        "properties": {
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/CanonicalPluginRow"
+            },
+            "title": "Plugins",
+            "type": "array"
+          },
+          "policy_observation": {
+            "$ref": "#/components/schemas/PluginPolicyObservation"
+          },
+          "toolsets": {
+            "items": {
+              "$ref": "#/components/schemas/PluginToolsetRow"
+            },
+            "title": "Toolsets",
+            "type": "array"
+          },
+          "portable_mcp_servers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Portable Mcp Servers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "plugins",
+          "policy_observation",
+          "toolsets",
+          "portable_mcp_servers"
+        ],
+        "title": "CanonicalPluginsListResult",
+        "type": "object"
+      },
       "CanonicalProfileRow": {
         "additionalProperties": false,
         "properties": {
@@ -28852,6 +28963,85 @@
           "name"
         ],
         "title": "PluginLiveSkill",
+        "type": "object"
+      },
+      "PluginPolicyEvidenceRow": {
+        "additionalProperties": false,
+        "description": "One active final-policy registration in the answering process (``PluginLedgerMixin.policy_evidence``).",
+        "properties": {
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "policy_sha256": {
+            "title": "Policy Sha256",
+            "type": "string"
+          },
+          "policy_fingerprint_kind": {
+            "const": "plugin_declared",
+            "title": "Policy Fingerprint Kind",
+            "type": "string"
+          },
+          "callback_code_sha256": {
+            "title": "Callback Code Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hook",
+          "policy_sha256",
+          "policy_fingerprint_kind",
+          "callback_code_sha256"
+        ],
+        "title": "PluginPolicyEvidenceRow",
+        "type": "object"
+      },
+      "PluginPolicyObservation": {
+        "additionalProperties": false,
+        "description": "Which gateway process answered (a process-bound observation), never a worker attestation.",
+        "properties": {
+          "schema": {
+            "const": "hermes.plugin-policy-observation/v1",
+            "title": "Schema",
+            "type": "string"
+          },
+          "pid": {
+            "title": "Pid",
+            "type": "integer"
+          },
+          "start_time": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Time"
+          },
+          "discovery_complete": {
+            "title": "Discovery Complete",
+            "type": "boolean"
+          },
+          "profile_id": {
+            "title": "Profile Id",
+            "type": "string"
+          },
+          "workers_attested": {
+            "title": "Workers Attested",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "schema",
+          "pid",
+          "start_time",
+          "discovery_complete",
+          "profile_id",
+          "workers_attested"
+        ],
+        "title": "PluginPolicyObservation",
         "type": "object"
       },
       "PluginRestartTarget": {
@@ -50863,6 +51053,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/KanbanRunResult"
+        }
+      }
+    },
+    {
+      "name": "plugins.list",
+      "summary": "The owner's profile-bound plugin rows with their active policy evidence and the answering process (``gateway/session_discovery.list_plugins``); ``observe_only`` never discovers.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/CanonicalPluginsListParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CanonicalPluginsListResult"
         }
       }
     },

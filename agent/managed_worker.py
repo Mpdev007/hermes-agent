@@ -131,18 +131,24 @@ def validate_bootstrap(frame):
 def bind_worker_policy(frame):
     """Freeze the owner's assignment process-wide before any config/provider/agent import.
 
-    The session's frozen config (never the live profile file) is what every config reader in
-    this process returns afterwards, so a profile edit after creation cannot reshape it (MCP
-    server definitions included). Ordinary sessions keep plugins, MCP and hooks; bypass sessions
+    Every config reader uses this owner's bootstrap snapshot: launch picks stay frozen
+    (MCP definitions included), while the owner refreshes required tool-policy declarations
+    and approval state before admission. Ordinary sessions keep plugins, MCP and hooks; bypass sessions
     also bind the safe / ignore-user-config policy.
     """
+    from agent.safe_worker_policy import validate_worker_bypass
+    source = frame['policy'].get('source')
+    if not isinstance(source, str) or not source:
+        raise ValueError('managed worker requires a trusted policy source')
+    validate_worker_bypass(source, frame['safe_mode'], frame['ignore_user_config'])
+    validate_worker_bypass(source, frame['policy'].get('safe_mode'), frame['policy'].get('ignore_user_config'))
     config = json.loads(frame['policy']['config_json'])
     if not frame['ignore_user_config']:
         from agent.safe_worker_policy import _bind_worker_config
-        _bind_worker_config(config)
+        _bind_worker_config(config, source=source)
         return
     from agent.safe_worker_policy import _bind_safe_worker_policy
-    _bind_safe_worker_policy(safe_mode=frame['safe_mode'], ignore_user_config=True, config=config)
+    _bind_safe_worker_policy(safe_mode=frame['safe_mode'], ignore_user_config=True, config=config, source=source)
 
 
 class WorkerChannel:

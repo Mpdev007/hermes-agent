@@ -36,8 +36,12 @@ def _due(authority, sid):
     """*sid*'s stored receipt when a catch-up would commit for it on this owner, else None. Read-only."""
     from gateway.session_local_recovery import owned_receipt
     from gateway.session_persistence import authority_persistence
+    from gateway.session_policy import refuse_stored_protected_bypass
     try:
         receipt = owned_receipt(authority, sid)[0]
+        # A stored protected bypass is refused before any catch-up writes for it (its identity is not
+        # rewritten); the restore that follows refuses it with the failing field.
+        refuse_stored_protected_bypass(receipt['policy'])
         return receipt if authority_persistence(authority).bindings.compression_adoptable(_binding(receipt)) else None
     except (KeyError, TypeError, ValueError, AttributeError):
         return None  # the restore refuses this receipt and logs the check that failed

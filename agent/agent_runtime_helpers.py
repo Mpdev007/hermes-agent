@@ -2031,22 +2031,6 @@ def switch_model(
     _persist_switch_billing_route(agent)
 
 
-def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
-    """Plugin pre-tool-call hook verdict: ``(block_message, function_args)``; failures never block."""
-    try:
-        from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-        block_message, modified_args = _dispatch_pre_tool_call_hooks(
-            function_name, function_args, task_id=effective_task_id or "",
-            session_id=getattr(agent, "session_id", "") or "", tool_call_id=tool_call_id or "",
-            turn_id=getattr(agent, "_current_turn_id", "") or "",
-            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-            middleware_trace=list(middleware_trace),
-        )
-        return block_message, (modified_args if modified_args is not None else function_args)
-    except Exception:
-        return None, function_args
-
-
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list | None = None,
                  pre_tool_block_checked: bool = False,
@@ -2058,7 +2042,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     invocation for display."""
     from agent.inline_tool_executors import (
         InlineToolContext, apply_transform_tool_result, emit_terminal_post_tool_call,
-        resolve_invoke_tool_executor, tool_hook_ids
+        _pre_tool_block_message, resolve_invoke_tool_executor, tool_hook_ids
     )
     if not isinstance(function_args, dict):
         function_args = {}
@@ -2094,6 +2078,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         )
 
         def _execute(next_args: dict) -> Any:
+            from hermes_cli.tool_dispatch_policy import final_tool_block
+            block = final_tool_block(function_name, next_args, **hook_ids,
+                                     middleware_trace=list(_tool_middleware_trace))
+            if block is not None:
+                result = json.dumps({"error": block}, ensure_ascii=False)
+                emit_terminal_post_tool_call(
+                    agent, function_name=function_name, function_args=next_args, result=result,
+                    effective_task_id=effective_task_id, tool_call_id=tool_call_id,
+                    status="blocked", error_type="plugin_block", error_message=block,
+                    middleware_trace=_tool_middleware_trace)
+                return result
             result = inline_executor(agent, next_args, inline_ctx)
             call_args = next_args if isinstance(next_args, dict) else function_args
             duration_ms = int((time.monotonic() - tool_start_time) * 1000)

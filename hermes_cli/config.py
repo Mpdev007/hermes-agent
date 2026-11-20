@@ -2980,8 +2980,7 @@ def _coerce_config_set_value(key: str, value: str) -> Any:
     return value
 
 
-# Container roots absent from DEFAULT_CONFIG whose shape is nonetheless fixed by their readers,
-# so the guardrail holds before anything is on disk (#114471: `model.aliases notamap`).
+# Readers fix these absent-default container shapes even before disk state (#114471).
 _KNOWN_CONTAINER_TYPES = {
     "custom_providers": "list",
     "providers": "mapping",
@@ -2991,6 +2990,7 @@ _KNOWN_CONTAINER_TYPES = {
     # so without these rows `config set plugins.enabled foo` stored a string every reader ignored.
     "plugins.enabled": "list",
     "plugins.disabled": "list",
+    "plugins.required_tool_policies": "mapping",
     "model_catalog.excluded_providers": "list",
 }
 # List slots whose readers go through ``parse_config_string_list``: a bare name is one entry.

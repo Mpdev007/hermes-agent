@@ -783,7 +783,7 @@ def _apply_request_middleware(
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
         mw = apply_tool_request_middleware(function_name, function_args, **ids.hook_kwargs())
-        return mw.payload, mw.original_payload, mw.trace
+        return mw.payload, mw.original_payload, [*trace, *mw.trace]
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
         return function_args, dict(function_args), trace
@@ -808,8 +808,9 @@ def _pre_dispatch_guards(function_name: str, function_args: dict[str, Any], skip
             )
             if modified_args is not None:
                 function_args = modified_args
-        except Exception as _hook_err:
-            logger.debug("pre_tool_call hook error: %s", _hook_err)
+        except (Exception, SystemExit) as _hook_err:
+            logger.debug("pre_tool_call hook error: %s", _hook_err, exc_info=True)
+            block_message = "BLOCKED: pre-tool policy delivery failed"
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 
@@ -866,6 +867,10 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
         dispatch_kwargs["turn_origin"] = turn_origin
 
     def _dispatch(next_args: dict[str, Any]) -> Any:
+        from hermes_cli.tool_dispatch_policy import ToolDispatchPolicyBlocked, final_tool_block
+        block = final_tool_block(function_name, next_args, **ids.hook_kwargs())
+        if block is not None:
+            raise ToolDispatchPolicyBlocked(block)
         from tools.connectors import dispatch_connector_call, is_connector_name
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id, ids.turn_id, ids.task_id)
@@ -942,6 +947,11 @@ def handle_function_call(
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
+    from hermes_cli.tool_dispatch_policy import ToolDispatchPolicyBlocked, final_tool_block
+    if function_name in ("tool_search", "tool_describe"):
+        block = final_tool_block(function_name, function_args, **ids.hook_kwargs())
+        if block is not None:
+            return _emit(tool_error(block), status="blocked", error_type="plugin_block", error_message=block)
     bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets, ids)
     if bridged is not None:
         result, underlying = bridged
@@ -1002,6 +1012,9 @@ def handle_function_call(
         _emit(result, duration_ms=duration_ms)
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
 
+    except ToolDispatchPolicyBlocked as e:
+        return _emit(tool_error(str(e)), duration_ms=_elapsed_ms(start),
+                     status="blocked", error_type="plugin_block", error_message=str(e))
     except Exception as e:
         from storage_user_copy import error_type_name
         error_msg = f"Error executing {function_name}: {e!s}"

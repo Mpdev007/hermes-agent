@@ -9,6 +9,7 @@ import logging
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from persistence.core.errors import AuthorityRefusal
+from gateway.session_policy_protection import validate_protected_bypass
 
 logger = logging.getLogger(__name__)
 
@@ -449,6 +450,7 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
         _refuse(bad_bypass, 'must be a boolean')
     safe_mode = params.get('safe_mode', False)
     ignore_user_config = safe_mode or params.get('ignore_user_config', False)
+    validate_protected_bypass(source, safe_mode, ignore_user_config)
     if 'api_key' in params and (not isinstance(params['api_key'], str) or not params['api_key'].strip()):
         _refuse('api_key', 'must be a non-empty string')
     model = params.get('model')
@@ -764,6 +766,17 @@ def _extract_config_secrets(value, private, path=()):
     # not match a vendor prefix. Only the authority keeps their original values.
     from hermes_cli.config import _SECRET_CONFIG_KEYS
     from agent.credential_persistence import _is_secret_payload_key
+    if (len(path) == 4 and path[:2] == ('plugins', 'required_tool_policies')
+            and isinstance(path[2], str) and type(path[3]) is int):
+        # A policy registration's key names a plugin, not an API credential.
+        # Only the native exact-shape validator can authorize this exception;
+        # a sibling credential or an extra field must never inherit it.
+        from hermes_cli.required_tool_policy import _requirements, RequiredPolicyUnavailable
+        try:
+            _requirements([value], path[2])
+        except RequiredPolicyUnavailable as exc:
+            raise AuthorityRefusal('invalid_params', field='plugins.required_tool_policies') from exc
+        return
     containers = {'env', 'headers', 'extra_headers', 'docker_env', 'docker_extra_args',
                   'terminal_docker_env', 'terminal_docker_extra_args'}
     items = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
@@ -1108,6 +1121,19 @@ def _check_stored_surface(policy) -> None:
                                         f'{policy.platform} is not a known surface pair')
 
 
+def refuse_stored_protected_bypass(data):
+    """The protected-bypass refusal for a stored receipt policy, before any path writes for it (compression
+    adoption): on the stored label and, for a peer-refreshed ``local`` receipt, on the creation label its
+    platform names (``restore_policy`` applies the same two checks). Read-only; refuses with ``invalid_params``."""
+    if not isinstance(data, dict) or not isinstance(data.get('source'), str):
+        return
+    labels = [data['source']]
+    if data['source'] == 'local' and isinstance(data.get('platform'), str) and data['platform'] in _LABEL_FOR_PLATFORM:
+        labels.append(_LABEL_FOR_PLATFORM[data['platform']])
+    for label in labels:
+        validate_protected_bypass(label, data.get('safe_mode'), data.get('ignore_user_config'))
+
+
 def restore_policy(data):
     """Reject incomplete private policy rather than rebuilding from current defaults.
 
@@ -1117,6 +1143,8 @@ def restore_policy(data):
     exactly the shapes our own writers persist (an empty model, a peer-refreshed ``local`` label, a
     cwd spelled for the other OS, a key another build wrote) and nothing looser.
     """
+    if isinstance(data, dict) and isinstance(data.get('source'), str):
+        validate_protected_bypass(data['source'], data.get('safe_mode'), data.get('ignore_user_config'))
     try:
         policy = _stored_policy(data)
         _check_stored_surface(policy)
@@ -1169,6 +1197,9 @@ def restore_policy(data):
         # ``acp``; local-interactive approval reads cli/tui/gui/acp), so a peer-refreshed ``local``
         # receipt runs under the label its platform says it was created with.
         source = _LABEL_FOR_PLATFORM[policy.platform] if policy.source == 'local' else policy.source
+        # The protection follows that effective label: a peer-refreshed ``local`` receipt of a protected
+        # surface (``acp``) is refused exactly as its creation label is (the pre-``try`` check saw ``local``).
+        validate_protected_bypass(source, policy.safe_mode, policy.ignore_user_config)
         return replace(policy, source=source, toolsets=tuple(policy.toolsets))
     except AuthorityRefusal:
         # A refusal that already names its field keeps its own reason (it is a ValueError subclass,
@@ -1235,6 +1266,7 @@ def policy_for_source(runner, source):
             # reinterpret a LOCAL route as a default CLI launch.
             raise AuthorityRefusal('storage_unavailable', field='policy',
                                    detail='the session has no restored policy (its receipt was refused or not yet recovered)')
+        validate_protected_bypass(policy.source, policy.safe_mode, policy.ignore_user_config)
         return policy
     return None
 
@@ -1287,6 +1319,7 @@ def policy_scope(policy, *, authority=None, home=None):
     if policy is None:
         yield
         return
+    validate_protected_bypass(policy.source, policy.safe_mode, policy.ignore_user_config)
     if not workspace_ready(policy):
         raise AuthorityRefusal('workspace_unavailable', field='cwd', detail=policy.cwd)
     from agent.runtime_cwd import set_session_cwd
