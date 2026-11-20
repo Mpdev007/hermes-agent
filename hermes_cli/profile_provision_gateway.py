@@ -56,8 +56,9 @@ def _wire(request: ProfileCreateRequest, profile: Optional[str], *, defer_defaul
     if defer_default_plugins:
         # Port adaptation A5: this invocation's default-only maintenance (explicit, pending or carried) crosses
         # the owning gateway. It only defers that gateway's automatic every-home installer for this create. A
-        # gateway that predates the key refuses it (4000) before creating: the create then runs here, under
-        # this process's own check, or (a URL's gateway) fails; the restriction is never dropped.
+        # gateway that predates the key refuses it (4000) before creating; A7.1: that refusal cannot be told
+        # from another unknown key, so the create is unsupported there (local or URL) and the restriction is
+        # never dropped. Only an owner without the method lets the create run here, under this process's check.
         wire["defer_default_plugins"] = True
     return {**wire, "profile": profile} if profile else wire
 
@@ -185,8 +186,11 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
         draining = _refusal_key(exc) == _DRAINING
         unknown_method = exc.unknown_method and exc.code in (None, -32601)
         if exc.code in _OLDER_OR_RETIRING or unknown_method or draining:
-            # Port adaptation A7: what the selected, authenticated owner refused before executing anything because
-            # it predates this request (an unknown key or method), as opposed to a retiring or draining owner.
+            # Port adaptation A7/A7.1: under the restriction only a refusal that PROVES the selected, authenticated
+            # owner predates this request lets it run here: an unknown method. A 4000 (unknown key) reaches this
+            # client as ``(request_failed, 4000, {})`` (``rpc_error`` keeps no free text), so it cannot show the
+            # refused key is the restriction's rather than one an older owner also lacks (``clone_config``,
+            # ``report``, ``sync_imports``): it is unsupported. A retiring or draining owner proves nothing either.
             predates = exc.code == 4000 or unknown_method
             if remote:
                 if defer and predates:
@@ -197,10 +201,14 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
                 why = "is restarting; retry" if exc.code == 5035 or draining else (
                     "predates this version; update it, or unset HERMES_TUI_GATEWAY_URL to create locally")
                 raise GatewayCreateError(f"{where} cannot create profiles for this terminal (it {why})") from exc
-            if defer and not predates:
-                # Only that refusal lets a restricted create run here, keeping this process's restriction.
+            if defer and exc.code == 4000:
+                raise GatewayCreateError(
+                    f"{where} does not support the default-only maintenance restriction this create carries "
+                    "(unsupported); nothing was created; update it, or create the profile after the maintenance"
+                ) from exc
+            if defer and not unknown_method:
                 raise GatewayCreateError(f"{where} is restarting; nothing was created; retry") from exc
-            return None
+            return None  # an unknown method (proof), or an unrestricted create: this process creates it
         refused = refusal_from(exc.data)
         if refused is not None:
             raise refused from exc

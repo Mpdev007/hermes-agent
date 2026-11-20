@@ -120,11 +120,12 @@ def _cli_create(name):
 def owning_gateway(monkeypatch):
     """A live owning gateway for this home, reached in-process: the real ``profiles.create`` receiver runs in a
     fresh context with this process's admission and relaunch handoff hidden, as the gateway process sees them.
-    ``older`` makes it refuse the new key as a gateway that predates it does (``extra="forbid"``: 4000)."""
+    ``older`` names the keys an older gateway lacks: it refuses them as its dispatcher does (``extra="forbid"``:
+    4000, the key only in the message text), and the client receives that through ``gateway_client.rpc_error``."""
     from hermes_cli import gateway_client, maintenance_scope, sessions_owner
     from tui_gateway import server
 
-    state = SimpleNamespace(sent=[], older=False, attach_error=None, refusal=None)
+    state = SimpleNamespace(sent=[], older=None, attach_error=None, refusal=None)
     monkeypatch.setattr(sessions_owner, "live_owner", lambda: SimpleNamespace(instance_id="owner-fixture"))
 
     class Client:
@@ -132,8 +133,9 @@ def owning_gateway(monkeypatch):
             state.sent.append(params)
             if state.refusal is not None:  # A7: the authenticated owner refuses
                 raise state.refusal
-            if state.older and "defer_default_plugins" in params:
-                raise gateway_client.GatewayRPCError("invalid_params", code=4000)
+            if state.older is not None and set(params) & set(state.older):
+                # A7.1: what an owner that predates these keys answers, received through the client boundary.
+                raise _older_owner_refusal(params, state.older)
             attribute = maintenance_scope.RELAUNCH_SCOPE_ATTRIBUTE
             admitted, carried = maintenance_scope._admitted, getattr(sys, attribute, None)
             maintenance_scope._admitted = None
@@ -216,17 +218,19 @@ def test_web_creation_proceeds_and_defers_only_the_every_home_installer(env, web
 
 
 def test_an_older_owning_gateway_never_drops_the_restriction(env, owning_gateway, monkeypatch):
-    """A gateway that predates the carrier refuses it before creating (4000); the create then runs here,
-    under this process's own check. A URL's gateway that predates it is an error, never a silent create."""
+    """A7.1 (Hermes 27d159d7): a gateway that predates the carrier (ba0482b4 lacks only it) refuses it before
+    creating with 4000, which reaches this client as ``(request_failed, 4000, {})``: it cannot prove the refused
+    key is the restriction's, so the create is unsupported, locally as at a URL; never a create without it."""
     from hermes_cli import profile_provision, profile_provision_gateway
     from hermes_cli.profile_provision_gateway import GatewayCreateError
 
-    owning_gateway.older = True
+    owning_gateway.older = ("defer_default_plugins",)
     before = _tree(env.sibling)
     with _scope(env, "carried", monkeypatch):
-        _cli_create("fallback")
+        with pytest.raises(GatewayCreateError, match=r"\(unsupported\); nothing was created"):
+            profile_provision_gateway.create_through_gateway(_request("fallback"))
     assert [sent.get("defer_default_plugins") for sent in owning_gateway.sent] == [True]
-    _assert_deferred_create(env, "fallback", before)
+    assert not (env.root / "profiles" / "fallback").exists() and env.effects == [] and _tree(env.sibling) == before
 
     monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "ws://127.0.0.1:9/api/ws")
     monkeypatch.setattr("hermes_cli.gateway_runtime.gateway_profile_home", lambda home: env.sibling)
@@ -411,3 +415,54 @@ def test_a_running_dashboards_later_request_takes_normal_policy(env, web, monkey
     assert response.status_code == 200, response.text
     assert (env.root / "profiles" / "later" / "config.yaml").is_file()
     assert launched == [["fixture-child", "hermes_cli.default_plugins"]] and not _owed(env)
+
+
+# ── A7.1 (Hermes 27d159d7): only a refusal that proves the owner predates the request permits a local create ──
+
+def _older_owner_refusal(params, lacking):
+    """The error an owner whose ``profiles.create`` contract lacks *lacking* answers: its dispatcher's unknown-key
+    refusal (``rpc_dispatch``: ``registry.validate_params`` → ``_err(rid, 4000, problem)``, the key only in the text),
+    turned into the exception by the client's own boundary (``gateway_client.rpc_error``)."""
+    import dataclasses
+
+    from pydantic import create_model
+
+    from hermes_cli import gateway_client
+    from tui_gateway.contracts import registry
+    from tui_gateway.contracts.profiles_vault_complete_foreign_subagents import ProfilesCreateParams
+
+    fields = {name: (field.annotation, field) for name, field in ProfilesCreateParams.model_fields.items()
+              if name not in lacking}
+    older = create_model("ProfilesCreateParams", __config__=ProfilesCreateParams.model_config, **fields)
+    _, problem = registry.validate_params(dataclasses.replace(registry.METHODS["profiles.create"], params=older),
+                                          params)
+    assert problem is not None and any(key in problem for key in lacking)
+    refusal = gateway_client.rpc_error({"code": 4000, "message": problem})
+    assert (str(refusal), refusal.code, refusal.data) == ("request_failed", 4000, {}), "the client kept the text"
+    return refusal
+
+
+def test_an_owner_without_the_method_lets_the_restricted_create_run_here(env, owning_gateway, monkeypatch):
+    """An unknown METHOD (-32601, kept by ``rpc_error``) is the attached owner's proof that it predates the request:
+    the create runs in this process, with this process's restriction (deferred, owed)."""
+    from hermes_cli import gateway_client
+    from tui_gateway.contracts import registry
+
+    owning_gateway.refusal = gateway_client.rpc_error(
+        {"code": -32601, "message": registry.unknown_method_message("profiles.create")})
+    assert owning_gateway.refusal.unknown_method
+    before = _tree(env.sibling)
+    with _scope(env, "carried", monkeypatch):
+        _cli_create("nomethod")
+    assert [sent.get("defer_default_plugins") for sent in owning_gateway.sent] == [True]
+    _assert_deferred_create(env, "nomethod", before)
+
+
+def test_an_ordinary_create_still_falls_back_on_an_older_owners_4000(env, owning_gateway):
+    """All-profile control: an owner older still (3b421578 lacks clone_config, report and sync_imports) refuses the
+    ordinary wire with 4000 and the unrestricted create runs here, as before."""
+    from hermes_cli import profile_provision_gateway
+
+    owning_gateway.older = ("clone_config", "report", "sync_imports", "defer_default_plugins")
+    assert profile_provision_gateway.create_through_gateway(_request("plain-old")) is None
+    assert len(owning_gateway.sent) == 1 and "defer_default_plugins" not in owning_gateway.sent[0]
