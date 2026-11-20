@@ -213,10 +213,15 @@ def _profile_create(args):
         alias=not no_alias, quiet=False,
         mirror_credentials=not getattr(args, "no_credentials", False),
         share_auth=not getattr(args, "isolated_auth", False))
+    from hermes_cli.default_plugins import installs_deferred
+    from hermes_cli.maintenance_scope import deferring_every_home_installs
     try:
         # A gateway serving this terminal makes the profile (one HERMES_TUI_GATEWAY_URL names always
         # does); with none it is made here. Either way the receipt below is read where it was made.
-        made = create_through_gateway(request) or ProfileCreateReceipt.of(request, provision_profile(request))
+        # Port adaptation A7.2: the deferral is read once, before dispatch, and carried through a local create and
+        # its installer decision, so a pending obligation that ends during the gateway round trip cannot widen it.
+        with deferring_every_home_installs(installs_deferred()):
+            made = create_through_gateway(request) or ProfileCreateReceipt.of(request, provision_profile(request))
     except (*CREATE_REFUSALS, GatewayCreateError) as e:
         _die(f"Error: {e}")
     print(f"\nProfile '{name}' created at {made.path}")

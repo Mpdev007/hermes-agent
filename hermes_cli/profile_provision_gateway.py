@@ -105,6 +105,44 @@ def _made_here(made: ProfileCreateReceipt, local: Optional[Path], was_profile: b
             and profile_matches_home(local.name, Path(made.path)))
 
 
+def _bounded_code(value) -> Optional[str]:
+    return value if isinstance(value, str) and value.replace("_", "").isalnum() and len(value) <= 64 else None
+
+
+def _live_owner_or_none():
+    """An unrestricted create's owner: the ready-or-None helper ``sessions_owner.live_owner``, where a failed
+    discovery is also None (the create then runs here, as it always has)."""
+    from hermes_cli.sessions_owner import live_owner
+    try:
+        return live_owner()
+    except Exception:  # health: allow BLE001 -- an ordinary create keeps its local fallback on any discovery failure
+        logger.debug("profile create: gateway discovery failed", exc_info=True)
+        return None
+
+
+def _restricted_local_owner():
+    """Port adaptation A7.2 (Hermes 49979351): the native discovery verdict for this home, where ordinary creates
+    and ``sessions prune`` keep the ready-or-None helper (``sessions_owner.live_owner``). A ready owner's endpoint;
+    ``None`` only for confirmed absence. A starting (an active start reservation), draining, incompatible,
+    conflicting or inaccessible owner (a control timeout or refused access included) is uncertainty: a
+    :class:`GatewayCreateError` naming its bounded state and code (never the detail), with nothing created."""
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+    from hermes_constants import get_hermes_home
+    try:
+        found = discover_gateway_endpoint(get_hermes_home().resolve())
+    except Exception as exc:  # health: allow BLE001 -- discovery raised: no verdict, so never a local create
+        raise GatewayCreateError("could not tell whether a running gateway owns this profile directory "
+                                 "(discovery_failed), so nothing was created under default-only maintenance; "
+                                 "retry") from exc
+    if found.state == "ready" and found.endpoint is not None:
+        return found.endpoint
+    if found.state == "absent":
+        return None
+    code = _bounded_code(found.reason_code)
+    raise GatewayCreateError(f"the gateway for this profile directory is {found.state}{f' ({code})' if code else ''}, "
+                             "so nothing was created under default-only maintenance; retry")
+
+
 async def _described_instance(client) -> Optional[str]:
     """The ``instance_id`` the connected gateway reports (``runtime.describe``), or None when it doesn't."""
     try:
@@ -126,7 +164,6 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
     ``ValueError`` / ``FileExistsError`` / ``FileNotFoundError``. When this create made the profile in this
     machine's profiles directory, the terminal's ``~/.local/bin`` wrapper is written here.
     """
-    from hermes_cli.sessions_owner import live_owner
     remote = os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip()
     where = _where(remote)
     endpoint, profile = None, None
@@ -140,21 +177,15 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
             raise GatewayCreateError(f"this terminal's HERMES_HOME is not a named profile, so {where} cannot "
                                      "create from it; nothing was created")
     from hermes_cli.default_plugins import installs_deferred
-    defer = installs_deferred()  # A5: read here, in the invocation that holds the scope
-    undiscovered = False
-    if not remote or request.alias:
-        try:
-            endpoint = live_owner()
-        except Exception:
-            undiscovered = True
-            logger.debug("profile create: gateway discovery failed", exc_info=True)
+    # A5: read here, in the invocation that holds the scope; A7.2: ``profile_cmd`` carries this same answer across
+    # a local create, so a pending obligation that ends during the round trip cannot widen it.
+    defer = installs_deferred()
+    if not remote and defer:
+        endpoint = _restricted_local_owner()  # None only for confirmed absence
+    elif not remote or request.alias:
+        endpoint = _live_owner_or_none()
     if not remote and endpoint is None:
-        if defer and undiscovered:
-            # Port adaptation A7: under default-only maintenance a failed discovery is no answer: an owner may
-            # serve this home, and a local create would bypass it. Nothing was created.
-            raise GatewayCreateError("could not tell whether a running gateway owns this profile directory, so "
-                                     "nothing was created under default-only maintenance; retry")
-        return None
+        return None  # this process creates it (a restricted create: under its own restriction)
     from hermes_cli.gateway_client import GatewayRPCError, NOT_SENT, connect_gateway
     machine = " on the gateway's machine" if remote else ""
     unknown = f"{where} may have created '{request.name}'; check `hermes profile list`{machine} before retrying"
@@ -201,7 +232,10 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
                 why = "is restarting; retry" if exc.code == 5035 or draining else (
                     "predates this version; update it, or unset HERMES_TUI_GATEWAY_URL to create locally")
                 raise GatewayCreateError(f"{where} cannot create profiles for this terminal (it {why})") from exc
-            if defer and exc.code == 4000:
+            # A7.2: the matched rejection is the -32601 every native owner answers for a method it lacks
+            # (tui_gateway/rpc_dispatch.py:23, gateway/session_controls.py:387-392); a reason with no code is not
+            # one any owner sends, so it proves nothing either.
+            if defer and (exc.code == 4000 or (unknown_method and exc.code != -32601)):
                 raise GatewayCreateError(
                     f"{where} does not support the default-only maintenance restriction this create carries "
                     "(unsupported); nothing was created; update it, or create the profile after the maintenance"

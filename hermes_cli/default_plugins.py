@@ -288,6 +288,23 @@ def _owed_batch(root: Path) -> frozenset:
     return frozenset(batch)
 
 
+def _claimed_batch(root: Path) -> frozenset:
+    """:func:`_owed_batch` for a pass that may settle what it captures. Port adaptation A7.2: an A5/A6 build's single
+    ``default-plugins.owed`` is first claimed by one atomic rename into ``owed.d``, so this pass owns exactly the
+    request that stood before it began. An A5/A6 writer that comes later finds no file (``Path.touch`` re-stamps an
+    existing file, else creates one) and leaves a new marker, which stays owed for a later pass; deleting the shared
+    name itself could drop that writer's request. A claimed request that is not settled stays owed in ``owed.d``."""
+    legacy = _state(root, "owed")
+    if legacy.is_file():
+        owed = _state(root, "owed.d")
+        owed.mkdir(parents=True, exist_ok=True)
+        try:
+            os.rename(legacy, owed / f"legacy-{time.time_ns():020d}-{os.getpid()}-{secrets.token_hex(8)}")
+        except FileNotFoundError:  # another pass claimed it first; that pass answers for it
+            pass
+    return _owed_batch(root)
+
+
 def deferred_request_owed() -> bool:
     """Whether a deferred request is owed: every profile's boot then owes the default-plugin step, even on a
     revision whose record had settled (``boot_bootstrap._owed_steps``)."""
@@ -372,10 +389,14 @@ def install_and_record(*, say: Callable[[str], None] = print, wait: float = 900.
     rerun = _state(root, "rerun")
     while True:
         started = time.time()
-        batch = _owed_batch(root)  # A7: the deferred requests this pass answers, captured before any home is read
+        batch = _claimed_batch(root)  # A7: the deferred requests this pass answers, captured before any home is read
         outcome = install_defaults_all_homes(say=say, wait=wait)
         if outcome.get("deferred") or not (rerun.exists() and rerun.stat().st_mtime >= started):
             break
+    if not outcome.get("deferred") and installs_deferred():
+        # Port adaptation A7.2: only a complete pass that is STILL ordinary settles its batch. Scope that became
+        # default-only (or unprovable) after the pass's last per-home check leaves every captured request owed.
+        outcome = {**outcome, "deferred": True}
     if outcome.get("deferred"):
         # Port adaptation A5: deferred, not failed: no backoff and nothing settled; the request stays owed.
         _owe_deferred(root)
@@ -404,8 +425,11 @@ def step_install_default_plugins() -> dict:
             # deferred request is left as it is, so the next ordinary start runs the step unchanged.
             return {"ok": True, "skipped": "default-only maintenance", "owed": True}
         root = Path(dependency_home_root())
-        batch = _owed_batch(root)  # A7: captured before the homes are enumerated
+        batch = _claimed_batch(root)  # A7: captured before the homes are enumerated
         if all(fetch_policy(home) == "denied" for home in dependency_homes()):
+            if installs_deferred():
+                # A7.2: the scan only answers for a scope that was still ordinary when it finished listing the homes.
+                return {"ok": True, "skipped": "default-only maintenance", "owed": True}
             # A5: nothing may install in any home, so a deferred request is answered as an ordinary create's.
             # A7: only the requests standing before this check; one recorded during it stays owed.
             _consume_owed(batch)

@@ -184,6 +184,9 @@ def test_forwarded_same_operation_work_keeps_the_floor_after_the_tail_cleared_th
 
 V1_ONLY = b"MAINTENANCE_SCOPE_SCHEMA = 1\n"
 A4_ONLY = b"MAINTENANCE_SCOPE_SCHEMA = 1\nRELAUNCH_SCOPE_ATTRIBUTE = '_hermes_maintenance_scope'\nRELAUNCH_SCOPE_SCHEMA = 1\n"
+# A7.2 (Hermes 49979351): an A6 target advertises capability 1 and cannot read A7's per-request deferred work.
+A6_TARGET = b"MAINTENANCE_SCOPE_SCHEMA = 1\nSCOPED_OPERATION_CAPABILITY = 1\n"
+TARGETS = {"v1-only": V1_ONLY, "a4-only": A4_ONLY, "a6-capability-1": A6_TARGET}
 
 
 def _complete_target():
@@ -191,12 +194,13 @@ def _complete_target():
     return Path(maintenance_scope.__file__).read_bytes()
 
 
-@pytest.mark.parametrize("target, refused", [("v1-only", True), ("a4-only", True), ("complete", False)])
+@pytest.mark.parametrize("target, refused", [("v1-only", True), ("a4-only", True), ("a6-capability-1", True),
+                                             ("complete", False)])
 def test_default_only_git_update_needs_the_operation_capability(env, monkeypatch, target, refused):
     from hermes_cli import update_cmd_commit as commit
     from hermes_cli.maintenance_scope import MaintenanceScope, maintenance_scope
 
-    payload = {"v1-only": V1_ONLY, "a4-only": A4_ONLY, "complete": _complete_target()}[target]
+    payload = {**TARGETS, "complete": _complete_target()}[target]
     monkeypatch.setattr(commit, "read_target_files", lambda git, root, ref, rels: {rels[0]: payload})
     with maintenance_scope(MaintenanceScope.select("default")):
         refusal = commit.scope_target_refusal(["git"], env.checkout, "target")
@@ -204,8 +208,8 @@ def test_default_only_git_update_needs_the_operation_capability(env, monkeypatch
     assert commit.scope_target_refusal(["git"], env.checkout, "target") is None  # the all-profile path
 
 
-@pytest.mark.parametrize("target, refused", [("v1-only", True), ("a4-only", True), ("missing", True),
-                                             ("complete", False)])
+@pytest.mark.parametrize("target, refused", [("v1-only", True), ("a4-only", True), ("a6-capability-1", True),
+                                             ("missing", True), ("complete", False)])
 def test_default_only_zip_update_needs_the_operation_capability_before_its_commit_point(env, tmp_path, target,
                                                                                        refused):
     """The ZIP gate reads the extracted target's ``hermes_cli/maintenance_scope.py`` as data, before the commit
@@ -218,8 +222,7 @@ def test_default_only_zip_update_needs_the_operation_capability_before_its_commi
     extracted = tmp_path / "extracted"
     (extracted / "hermes_cli").mkdir(parents=True)
     if target != "missing":
-        (extracted / "hermes_cli" / "maintenance_scope.py").write_bytes(
-            {"v1-only": V1_ONLY, "a4-only": A4_ONLY, "complete": _complete_target()}[target])
+        (extracted / "hermes_cli" / "maintenance_scope.py").write_bytes({**TARGETS, "complete": _complete_target()}[target])
     capability = extracted / "hermes_cli/maintenance_scope.py"
     with maintenance_scope(MaintenanceScope.select("default")):
         if refused:

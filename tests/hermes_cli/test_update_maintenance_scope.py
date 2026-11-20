@@ -212,8 +212,8 @@ def test_target_without_scope_protocol_is_refused(homes,payload):
 def test_compatible_target_capability_is_read_not_executed(homes):
     from hermes_cli.maintenance_scope import MaintenanceScope,maintenance_scope,require_scope_target
     with maintenance_scope(MaintenanceScope.select('default')):
-        # A6 (owner d56ea47c): a complete target declares the v1 marker AND the operation capability.
-        require_scope_target(b'MAINTENANCE_SCOPE_SCHEMA = 1\nSCOPED_OPERATION_CAPABILITY = 1\n'
+        # A6 (owner d56ea47c): a complete target declares the v1 marker AND the operation capability (A7.2: 2).
+        require_scope_target(b'MAINTENANCE_SCOPE_SCHEMA = 1\nSCOPED_OPERATION_CAPABILITY = 2\n'
                              b'raise RuntimeError("untrusted target must not execute")\n')
 
 def test_git_commit_point_refuses_old_target_before_pause_or_obligations(homes,tmp_path,monkeypatch):

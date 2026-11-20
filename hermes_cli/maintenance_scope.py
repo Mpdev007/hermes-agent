@@ -19,7 +19,9 @@ MAINTENANCE_SCOPE_SCHEMA = 1
 # Port adaptation A6 (owner d56ea47c): a distinct target capability attesting the complete operation lifetime
 # (launch, relaunch and same-operation start/forwarding seams; A4/A6) and automatic installer deferral (A5).
 # Default-only Git and ZIP updates require it beside the v1 marker; the all-profile path never reads it.
-SCOPED_OPERATION_CAPABILITY = 1
+# A7.2 (Hermes 49979351): 2 = also the per-request deferred-work directory (``default-plugins.owed.d``, A7). An A6
+# target (1) reads only the single legacy marker, so it would never see or settle that work. Schema v1 unchanged.
+SCOPED_OPERATION_CAPABILITY = 2
 
 # Port adaptation A4: the record venv_sync.relaunch_command carries into the managed-interpreter
 # child it starts (beside ``sys._hermes_relaunched``; never an environment variable, so processes
@@ -336,7 +338,8 @@ def require_scope_target(source: bytes | None) -> None:
         # A6: a v1-only or A4-only target would drop the restriction after its launch tail or run the automatic
         # every-home installer; refused before any source changes.
         raise ScopeSafetyRefusal("update target does not support default-only maintenance across its whole "
-                                 "operation (launch lifetime and installer deferral); checkout unchanged")
+                                 "operation (launch lifetime, installer deferral and per-request deferred work); "
+                                 "checkout unchanged")
 
 
 def record_scope() -> None:

@@ -52,6 +52,7 @@ def env(tmp_path, monkeypatch):
     for home in (root, sibling):
         (home / "config.yaml").write_text("config_version: 1\nmodel:\n  default: fixture-model\n")
         (home / ".env").write_text("FIXTURE=only\n")
+    root.chmod(0o700)  # A7.2: native discovery runs for real here, and refuses a home another user may write
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)  # fetching allowed: the effects are reachable
@@ -116,21 +117,70 @@ def _cli_create(name):
     profile_cmd._profile_create(parser.parse_args(["profile", "create", name, "--no-alias", "--no-skills"]))
 
 
+class _ControlPeer:
+    """A real control socket for *home* answering ``identify`` with *payload* (the gateway's own
+    ``GatewayControlServer``, on an event loop of its own): native discovery reads it exactly as it reads a live
+    owner's (pattern: ``tests/hermes_cli/test_gateway_runtime.py``)."""
+
+    def __init__(self, home, payload):
+        import asyncio
+        import threading
+        from gateway.control_socket import GatewayControlServer
+        self.home, self.loop = home, asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, name="control-peer", daemon=True)
+        self.server = GatewayControlServer(home, verb_handlers={"identify": lambda: payload})
+        self.serving = False
+
+    def start(self):
+        import asyncio
+        self.thread.start()
+        assert asyncio.run_coroutine_threadsafe(self.server.start(), self.loop).result(timeout=30)
+        self.serving = True
+        pointer = self.home / "gateway.sock.path"
+        if pointer.exists():
+            pointer.chmod(0o600)
+
+    def stop(self):
+        """Stop answering (the socket and its pointer are removed); idempotent."""
+        import asyncio
+        if self.serving:
+            self.serving = False
+            asyncio.run_coroutine_threadsafe(self.server.stop(), self.loop).result(timeout=30)
+
+    def close(self):
+        self.stop()
+        if self.thread.is_alive():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.thread.join(timeout=30)
+        self.loop.close()
+
+
 @pytest.fixture
-def owning_gateway(monkeypatch):
+def owning_gateway(env, monkeypatch):
     """A live owning gateway for this home, reached in-process: the real ``profiles.create`` receiver runs in a
     fresh context with this process's admission and relaunch handoff hidden, as the gateway process sees them.
     ``older`` names the keys an older gateway lacks: it refuses them as its dispatcher does (``extra="forbid"``:
-    4000, the key only in the message text), and the client receives that through ``gateway_client.rpc_error``."""
-    from hermes_cli import gateway_client, maintenance_scope, sessions_owner
+    4000, the key only in the message text), and the client receives that through ``gateway_client.rpc_error``.
+
+    A7.2 (Hermes 49979351): the owner is FOUND through the real discovery boundary: a control socket on this home
+    answers ``identify`` with ``payload`` (ready by default; tests change its state or stop the ``peer``), and
+    ``dialed`` records the instance each dial named. Only the WebSocket transport is a double."""
+    from hermes_cli import gateway_client, maintenance_scope
     from tui_gateway import server
 
-    state = SimpleNamespace(sent=[], older=None, attach_error=None, refusal=None)
-    monkeypatch.setattr(sessions_owner, "live_owner", lambda: SimpleNamespace(instance_id="owner-fixture"))
+    identity = str(env.root.resolve())
+    payload = {"protocol": 1, "runtime_protocol": 1, "instance_id": "owner-fixture", "authority_epoch": 1,
+               "hermes_home": identity, "state": "ready", "api_origin": "http://127.0.0.1:41817",
+               "supervisor": "none", "served_profiles": [{"profile_id": identity, "home": identity}],
+               "capabilities": ["session-authority-v1"]}
+    state = SimpleNamespace(sent=[], dialed=[], older=None, attach_error=None, refusal=None, before_answer=None,
+                            payload=payload, peer=_ControlPeer(env.root, payload))
 
     class Client:
         async def rpc(self, method, _timeout=None, **params):
             state.sent.append(params)
+            if state.before_answer is not None:  # A7.2: something that happens while the owner answers
+                state.before_answer()
             if state.refusal is not None:  # A7: the authenticated owner refuses
                 raise state.refusal
             if state.older is not None and set(params) & set(state.older):
@@ -154,11 +204,16 @@ def owning_gateway(monkeypatch):
 
     @contextlib.asynccontextmanager
     async def connect(endpoint=None, *args, **kwargs):
+        state.dialed.append(getattr(endpoint, "instance_id", None))
         if state.attach_error is not None:  # A7: dial, ticket, identity or protocol check fails before attaching
             raise state.attach_error
         yield Client()
     monkeypatch.setattr(gateway_client, "connect_gateway", connect)
-    return state
+    state.peer.start()
+    try:
+        yield state
+    finally:
+        state.peer.close()
 
 
 @pytest.fixture
@@ -187,12 +242,9 @@ def _assert_deferred_create(env, name, before):
 @pytest.mark.parametrize("source", SOURCES)
 @pytest.mark.parametrize("path", ["cli-direct", "cli-owning-gateway"])
 def test_cli_creation_proceeds_and_defers_only_the_every_home_installer(env, monkeypatch, request, path, source):
-    from hermes_cli import sessions_owner
     from tui_gateway.contracts.profiles_vault_complete_foreign_subagents import ProfilesCreateParams
 
-    if path == "cli-direct":
-        monkeypatch.setattr(sessions_owner, "live_owner", lambda: None)  # no gateway serves this home
-    else:
+    if path == "cli-owning-gateway":  # cli-direct: no control socket or start reservation, so discovery: absent
         gateway = request.getfixturevalue("owning_gateway")
     before = _tree(env.sibling)
     with _scope(env, source, monkeypatch):
@@ -304,9 +356,7 @@ def test_a_deferred_create_after_a_settled_revision_stays_owed_until_a_later_ord
 
     # A create under a pending default-only obligation leaves exactly one install-level request.
     with _scope(env, "pending", monkeypatch):
-        from hermes_cli import sessions_owner
-        monkeypatch.setattr(sessions_owner, "live_owner", lambda: None)
-        _cli_create("late")
+        _cli_create("late")  # no control socket or start reservation: discovery confirms absence
         assert len(_owed(env)) == 1 and env.effects == []
         # A same-scope retry leaves it owed, with nothing started.
         assert boot() == DEFERRED
@@ -340,7 +390,10 @@ def test_a_deferred_create_after_a_settled_revision_stays_owed_until_a_later_ord
 
 # ── A7 (Hermes a297425f): a restricted create falls back locally only on the authenticated owner's own refusal ──
 
-FAILURES = ("identity", "protocol", "unreachable", "draining", "retiring", "discovery")
+ATTACH_FAILURES = ("identity", "protocol", "unreachable", "draining", "retiring")
+# A7.2: a restricted create's discovery outcomes are its own test below (the native verdict); an ordinary create
+# keeps the ready-or-None helper, so for it a raising ``live_owner`` is still one more local-fallback case.
+FAILURES = (*ATTACH_FAILURES, "discovery")
 
 
 def _request(name):
@@ -369,10 +422,10 @@ def _fail(owning_gateway, monkeypatch, kind):
         owning_gateway.refusal = gateway_client.GatewayRPCError("retiring", code=5035)
 
 
-@pytest.mark.parametrize("kind", FAILURES)
+@pytest.mark.parametrize("kind", ATTACH_FAILURES)
 def test_a_restricted_create_never_falls_back_without_the_owners_own_refusal(env, owning_gateway, monkeypatch, kind):
-    """A failed discovery, dial, identity or protocol check and a retiring or draining owner are no refusal of the
-    request by the authenticated selected owner: nothing is created anywhere and nothing is replayed."""
+    """A failed dial, identity or protocol check and a retiring or draining owner are no refusal of the request by
+    the authenticated selected owner: nothing is created anywhere and nothing is replayed."""
     from hermes_cli import profile_provision_gateway
     from hermes_cli.profile_provision_gateway import GatewayCreateError
 
@@ -383,6 +436,7 @@ def test_a_restricted_create_never_falls_back_without_the_owners_own_refusal(env
             profile_provision_gateway.create_through_gateway(_request("held"))
     assert not (env.root / "profiles" / "held").exists() and env.effects == [] and _tree(env.sibling) == before
     assert len(owning_gateway.sent) == (1 if kind in ("draining", "retiring") else 0)
+    assert owning_gateway.dialed == ["owner-fixture"], "the request was not dialed to the one discovered owner"
 
 
 @pytest.mark.parametrize("kind", FAILURES)
@@ -466,3 +520,136 @@ def test_an_ordinary_create_still_falls_back_on_an_older_owners_4000(env, owning
     owning_gateway.older = ("clone_config", "report", "sync_imports", "defer_default_plugins")
     assert profile_provision_gateway.create_through_gateway(_request("plain-old")) is None
     assert len(owning_gateway.sent) == 1 and "defer_default_plugins" not in owning_gateway.sent[0]
+
+
+# ── A7.2 (Hermes 49979351): a restricted local create keeps the native discovery verdict ──
+
+def _hold_start_reservation(env) -> int:
+    """An active start reservation: this home's ``gateway.lock`` held (``flock``) on a descriptor of its own, before
+    any control socket is published (``gateway_runtime_discovery.missing_owner_state``: ``starting``)."""
+    import fcntl
+    import os
+    fd = os.open(env.root / "gateway.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+VERDICTS = ("ready", "absent", "starting", "draining", "restart-wait", "control-timeout")
+
+
+@pytest.mark.parametrize("verdict", VERDICTS)
+def test_a_restricted_local_create_follows_the_native_discovery_verdict(env, owning_gateway, monkeypatch, verdict):
+    """Through the real discovery boundary: a ready owner gets the one request; confirmed absence lets this process
+    create it (deferred and owed); an active start reservation, a draining owner (a restart's after-turn wait
+    included) or a control timeout is no answer, so nothing is created anywhere and nothing is dialed."""
+    import os
+
+    from gateway.drain_control import RESTART_WAIT_REASON
+    from hermes_cli import gateway_runtime_discovery, profile_provision_gateway
+    from hermes_cli.profile_provision_gateway import GatewayCreateError
+
+    lock = None
+    if verdict in ("absent", "starting"):
+        owning_gateway.peer.stop()  # no control socket answers for this home
+        if verdict == "starting":
+            lock = _hold_start_reservation(env)
+    elif verdict == "draining":
+        owning_gateway.payload["state"] = "draining"
+    elif verdict == "restart-wait":
+        owning_gateway.payload.update(state="draining", drain_reason=RESTART_WAIT_REASON)
+    elif verdict == "control-timeout":
+        def timed_out(home, *, timeout):
+            raise TimeoutError  # what the control-socket read raises past its deadline
+        monkeypatch.setattr(gateway_runtime_discovery, "query_identify", timed_out)
+    before = _tree(env.sibling)
+    try:
+        with _scope(env, "carried", monkeypatch):
+            if verdict in ("ready", "absent"):
+                _cli_create("seen")
+            else:
+                with pytest.raises(GatewayCreateError, match="nothing was created under default-only maintenance"):
+                    profile_provision_gateway.create_through_gateway(_request("seen"))
+    finally:
+        if lock is not None:
+            os.close(lock)
+    if verdict in ("ready", "absent"):
+        _assert_deferred_create(env, "seen", before)
+        assert owning_gateway.dialed == (["owner-fixture"] if verdict == "ready" else [])
+        assert [sent.get("defer_default_plugins") for sent in owning_gateway.sent] == (
+            [True] if verdict == "ready" else [])
+    else:
+        assert not (env.root / "profiles" / "seen").exists() and env.effects == [] and _tree(env.sibling) == before
+        assert owning_gateway.dialed == [] and owning_gateway.sent == []
+
+
+def test_an_ordinary_create_keeps_the_ready_or_none_helper(env, owning_gateway):
+    """All-profile control: the same draining owner is still "no owner" for an unrestricted create, which runs here
+    as before (``sessions_owner.live_owner`` and its other callers are unchanged)."""
+    from hermes_cli import profile_provision_gateway
+
+    owning_gateway.payload["state"] = "draining"
+    assert profile_provision_gateway.create_through_gateway(_request("plain-draining")) is None
+    assert owning_gateway.dialed == [] and owning_gateway.sent == []
+
+
+def _unknown_method(code):
+    from hermes_cli import gateway_client
+    from tui_gateway.contracts import registry
+    if code is None:  # an owner that sends only the bounded reason
+        return gateway_client.rpc_error({"message": "unknown_method"})
+    return gateway_client.rpc_error({"code": code, "message": registry.unknown_method_message("profiles.create")})
+
+
+@pytest.mark.parametrize("refusal, matched", [
+    ("unknown-method", True),           # -32601 to this very request: the owner has no profiles.create
+    ("unknown-method-reason-only", False),  # no native owner sends the reason without -32601: unprovable
+    ("unknown-key-4000", False),        # the real older-owner frame: which key was refused is unprovable
+    ("invalid-params-4001", False),
+    ("handler-failure-5062", False),
+])
+def test_only_a_matched_pre_dispatch_rejection_permits_the_restricted_local_create(env, owning_gateway, monkeypatch,
+                                                                                   refusal, matched):
+    """The attached, discovered owner's own answer to this one request: only a rejection of the method itself proves
+    it predates the request. Anything else leaves nothing created and nothing replayed or redirected."""
+    from hermes_cli import gateway_client
+    from hermes_cli.profile_provision_gateway import GatewayCreateError
+
+    if refusal == "unknown-key-4000":
+        owning_gateway.older = ("defer_default_plugins",)
+    else:
+        owning_gateway.refusal = {
+            "unknown-method": lambda: _unknown_method(-32601),
+            "unknown-method-reason-only": lambda: _unknown_method(None),
+            "invalid-params-4001": lambda: gateway_client.GatewayRPCError("invalid_params", code=4001,
+                                                                          data={"reason": "invalid_params"}),
+            "handler-failure-5062": lambda: gateway_client.GatewayRPCError("handler_failed", code=5062),
+        }[refusal]()
+    before = _tree(env.sibling)
+    with _scope(env, "carried", monkeypatch):
+        if matched:
+            _cli_create("matched")
+        else:
+            from hermes_cli import profile_provision_gateway
+            with pytest.raises(GatewayCreateError):
+                profile_provision_gateway.create_through_gateway(_request("matched"))
+    assert owning_gateway.dialed == ["owner-fixture"] and len(owning_gateway.sent) == 1
+    assert owning_gateway.sent[0].get("defer_default_plugins") is True
+    if matched:
+        _assert_deferred_create(env, "matched", before)
+    else:
+        assert not (env.root / "profiles" / "matched").exists() and env.effects == [] and _tree(env.sibling) == before
+
+
+def test_the_captured_restriction_governs_the_local_create_after_the_marker_clears(env, owning_gateway, monkeypatch):
+    """The create is restricted by a pending obligation, read once before dispatch. While the owner answers (it has
+    no ``profiles.create``: the matched refusal), the obligation ends and its marker is cleared. The local create and
+    its installer decision still defer: the captured answer is carried, not re-read."""
+    from hermes_cli.venv_sync import clear_completion
+
+    owning_gateway.refusal = _unknown_method(-32601)
+    owning_gateway.before_answer = lambda: clear_completion(env.checkout)
+    before = _tree(env.sibling)
+    with _scope(env, "pending", monkeypatch):
+        _cli_create("roundtrip")
+    assert [sent.get("defer_default_plugins") for sent in owning_gateway.sent] == [True]
+    _assert_deferred_create(env, "roundtrip", before)  # red on A7.1: the local installer re-read the cleared marker
