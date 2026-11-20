@@ -92,6 +92,9 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     selector = [] if home.parent.name == "profiles" else ["--profile", "default"]
     command = [sys.executable, "-m", "hermes_cli.main", *selector, "gateway", "run", "--quiet",
                *(["--idle-exit"] if idle_exit else []), *(["--force"] if force else [])]
+    # Port adaptation A6: a gateway this operation brings up boots under its default-only restriction.
+    from hermes_cli.venv_sync import same_operation_command
+    command = same_operation_command(command, root)
     # The target profile's own secrets, never the launching client's: a `hermes -p work` client's
     # dotenv would otherwise become the default daemon's frozen launch env (host_gateway_child_env).
     from tools.environments.local import served_profile_child_env

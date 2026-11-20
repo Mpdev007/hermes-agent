@@ -198,7 +198,7 @@ def _complete_scoped(
         from hermes_cli.maintenance_scope import current_scope
         if current_scope().mode == "default":
             from hermes_cli.venv_sync import clear_completion
-            clear_completion(root)
+            clear_completion(root, expected=current_scope())  # A6: never another owner's broader marker
     if followups is not None:
         followups.extend(owed)
     # The SQLite verdict is not tail work (re-running the tail cannot fix the interpreter); it

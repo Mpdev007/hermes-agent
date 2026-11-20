@@ -1419,6 +1419,10 @@ def _run_serve(serve, config, host: str, port: int) -> None:
 
 def start_server(*args, **kwargs):
     """Run the dashboard/serve backend; no lazy install may prompt on an inherited TTY (#125607)."""
+    # Port adaptation A6: the start-up operation (bootstrap and main's boot) ends before the server answers
+    # independent requests.
+    from hermes_cli.maintenance_scope import end_launch_operation
+    end_launch_operation()
     from pm.extras import suppress_interactive_install_prompts
     with suppress_interactive_install_prompts():
         return _start_server_runtime(*args, **kwargs)

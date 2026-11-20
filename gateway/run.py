@@ -4975,6 +4975,10 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
                         verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
     """Run the process lifecycle; the runner facade remains the public entrypoint."""
+    # Port adaptation A6: this process's start-up operation (bootstrap and boot maintenance, which both entries
+    # ran before this) ends here; the requests it serves next are independent of it.
+    from hermes_cli.maintenance_scope import end_launch_operation
+    end_launch_operation()
     from gateway.run_bootstrap import start_gateway as bootstrap
     return await bootstrap(config, replace, verbosity, force, idle_exit)
 

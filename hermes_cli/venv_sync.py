@@ -293,9 +293,21 @@ def completion_retry_state(project_root: Path, *, now=None) -> tuple[bool, int, 
     return False, attempts, int(COMPLETION_RETRY_BACKOFF_SECONDS - age)
 
 
-def clear_completion(root: Path) -> None:
+def clear_completion(root: Path, *, expected=None) -> bool:
+    """Clear the tail obligation and its attempt record. With *expected* (the scope whose tail just finished),
+    only when the marker still names that scope: pending work of another scope belongs to its original owner
+    and stays, with its record (port adaptation A6). Returns whether it cleared."""
+    if expected is not None:
+        from hermes_cli.maintenance_scope import ScopeSafetyRefusal, pending_scope
+        try:
+            pending = pending_scope(root)
+        except ScopeSafetyRefusal:
+            return False
+        if pending is not None and pending != expected:
+            return False
     completion_pending_path(root).unlink(missing_ok=True)
     _completion_attempts_path(root).unlink(missing_ok=True)
+    return True
 
 
 def refuse_foreign_owned_venv(project_root: Path) -> None:
@@ -616,13 +628,13 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
                 _record_completion_attempt(root, failed=True, inputs=_sync_inputs_digest(root))
             raise
         if completed:
-            clear_completion(root)
+            clear_completion(root, expected=scope)
             return
     elif scope.mode == "all" and _tree_matches_completed_stamp(root):
         # The stamp names HEAD, so the last install/update already built this tree:
         # a pending marker is a leftover from a previous home/install, not an
         # interrupted update, and owing nothing is quieter than announcing one.
-        clear_completion(root)
+        clear_completion(root, expected=scope)
         return
     else:
         print("hermes: finishing an interrupted source update...", file=sys.stderr, flush=True)
@@ -660,7 +672,8 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         raise RuntimeError(
             "source update completion failed; run `hermes update` to finish it"
         )
-    clear_completion(root)
+    # A6: a marker another owner armed meanwhile stays; activation then refuses with that owner's remedy.
+    clear_completion(root, expected=scope)
 
 
 def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | None = None) -> None:
@@ -701,6 +714,25 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
     # must not make early recovery immediately rebuild it a second time.
     for name in (".update-incomplete", ".lazy-refresh-incomplete"):
         (root / name).unlink(missing_ok=True)
+
+
+def same_operation_command(command: list[str], root: Path) -> list[str]:
+    """Port adaptation A6: *command* (``[python, "-m", module, *args]``) for a process this operation starts to do
+    part of it (a gateway it brings up). Under this operation's default-only restriction the process enters
+    through the relaunch seam's recognised inline shape carrying the record (:func:`relaunch_command`), which its
+    bootstrap validates again; otherwise the command is unchanged. Never an environment variable or a persisted
+    unit command, so later independent starts and the process's own later requests are unaffected."""
+    from hermes_cli.maintenance_scope import RELAUNCH_SCOPE_ATTRIBUTE, ScopeSafetyRefusal, relaunch_handoff
+    handoff = relaunch_handoff(root)
+    if handoff is None:
+        return command
+    if len(command) < 3 or command[1] != "-m":
+        raise ScopeSafetyRefusal("cannot carry default-only maintenance into this start; nothing was started")
+    python, _flag, module, *args = command
+    source = (f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {[module, *args]!r}; "
+              f"sys.{RELAUNCH_SCOPE_ATTRIBUTE} = {handoff!r}; "
+              f"runpy.run_module({module!r}, run_name='__main__', alter_sys=True)")
+    return [python, "-c", source]
 
 
 def relaunch_command(

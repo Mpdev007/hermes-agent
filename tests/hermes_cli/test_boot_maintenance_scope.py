@@ -432,7 +432,10 @@ def test_an_admitted_default_scope_cannot_be_broadened_within_the_invocation(hom
 
     with pytest.raises(ScopeSafetyRefusal):  # an explicit all-profile flag
         maintenance_scope.resolve_launch_scope(checkout, ["pm", "install", "--maintenance-scope", "all"])
-    arm_completion(checkout)  # another start armed an all-profile obligation meanwhile: not this one's
+    # Another process armed an all-profile obligation meanwhile (its own marker payload): not this one's. A6:
+    # an arm from THIS process would be this operation's and carry its floor, so it is written as that owner's.
+    from hermes_cli.venv_sync import completion_pending_path
+    completion_pending_path(checkout).write_text("source update tail not finished\n", encoding="utf-8")
     with pytest.raises(ScopeSafetyRefusal):
         maintenance_scope.resolve_launch_scope(checkout, [])
     before = _tree(sibling)

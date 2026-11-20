@@ -16,6 +16,10 @@ import sys
 
 # Target-tree capability: understood by source updates before moving any code.
 MAINTENANCE_SCOPE_SCHEMA = 1
+# Port adaptation A6 (owner d56ea47c): a distinct target capability attesting the complete operation lifetime
+# (launch, relaunch and same-operation start/forwarding seams; A4/A6) and automatic installer deferral (A5).
+# Default-only Git and ZIP updates require it beside the v1 marker; the all-profile path never reads it.
+SCOPED_OPERATION_CAPABILITY = 1
 
 # Port adaptation A4: the record venv_sync.relaunch_command carries into the managed-interpreter
 # child it starts (beside ``sys._hermes_relaunched``; never an environment variable, so processes
@@ -129,9 +133,10 @@ def publication_scope(root: Path, requested=None) -> MaintenanceScope:
     carried default restriction cannot be widened by a missing/changed marker.
     """
     pending = pending_scope(root)
+    floor = _invocation_floor(root)  # A6: this operation's admitted or carried default (None once ended)
     if requested is None:
         active = current_scope()
-        scope = active if active.mode == "default" else (pending or active)
+        scope = active if active.mode == "default" else (floor or pending or active)
     elif isinstance(requested, MaintenanceScope):
         scope = requested
     elif isinstance(requested, dict):
@@ -143,10 +148,18 @@ def publication_scope(root: Path, requested=None) -> MaintenanceScope:
         from pm.environments import owning_home_root
         if owning_home_root(root) is not None:
             raise ScopeSafetyRefusal("default-only maintenance cannot mutate a borrowed checkout")
-    if pending is not None and pending.mode == 'default' and pending != scope:
-        raise ScopeSafetyRefusal('cannot broaden a pending default-only maintenance obligation')
+    if pending is not None and pending != scope:
+        # A6: pending work of another scope belongs to its original owner, in either direction: never
+        # discharged, re-armed or widened here; the caller skips its maintenance or refuses activation.
+        if pending.mode == 'default':
+            raise ScopeSafetyRefusal('cannot broaden a pending default-only maintenance obligation; finish it with '
+                                     '`hermes update --maintenance-scope default --no-gateway-restart` first')
+        raise ScopeSafetyRefusal('an unfinished all-profile update owns the pending maintenance; run `hermes update` '
+                                 'to finish it before default-only maintenance')
     if current_scope().mode == 'default' and current_scope() != scope:
         raise ScopeSafetyRefusal('cannot broaden active default-only maintenance')
+    if floor is not None and scope != floor:
+        raise ScopeSafetyRefusal("cannot broaden this operation's default-only maintenance")
     return scope
 
 
@@ -202,6 +215,16 @@ def admit_launch_scope(root: Path, argv: list[str]) -> MaintenanceScope:
     return scope
 
 
+def end_launch_operation() -> None:
+    """Port adaptation A6: a long-lived server ends its start-up operation once its own start-up maintenance
+    ran. Later requests, and the processes started for them, are independent: a pending obligation still
+    applies to them, this operation's admitted or carried default no longer does."""
+    global _admitted
+    _admitted = None
+    if hasattr(sys, RELAUNCH_SCOPE_ATTRIBUTE):
+        delattr(sys, RELAUNCH_SCOPE_ATTRIBUTE)
+
+
 def relaunch_handoff(root: Path) -> dict | None:
     """The record a managed-interpreter relaunch into *root* carries; None for all-profile."""
     floor = _invocation_floor(root)
@@ -216,9 +239,9 @@ def resolve_launch_scope(root: Path, argv: list[str]) -> MaintenanceScope:
     """Validate authority before even early recovery or a launch short-circuit.
 
     Pending scope applies to flagless starts and repair commands as well. A default-only scope
-    this invocation already validated (:func:`_invocation_floor`) still applies after its pending
-    marker is cleared, and can never be broadened. This is stdlib-only: it must work before
-    activation makes SDKs importable.
+    this operation already validated (:func:`_invocation_floor`) still applies after its pending
+    marker is cleared, and can never be broadened (:func:`publication_scope`). This is stdlib-only:
+    it must work before activation makes SDKs importable.
     """
     from hermes_cli._parser import command_argv
     command = command_argv(argv)
@@ -238,19 +261,11 @@ def resolve_launch_scope(root: Path, argv: list[str]) -> MaintenanceScope:
         args, _ = parser.parse_known_args(command[1:])
         requested = args.maintenance_scope
     try:
-        floor = _invocation_floor(root)
-        if floor is not None and requested is None:
-            # A flagless start keeps the scope it was admitted under. An obligation armed by
-            # another start since then is not this invocation's to discharge or widen.
-            pending = pending_scope(root)
-            if pending is not None and pending != floor:
-                raise ScopeSafetyRefusal("the pending maintenance obligation changed during this invocation")
-            requested = floor
+        # The operation floor, a pending owner's conflicting work (either direction) and broadening are
+        # refused by publication_scope, which every native seam shares (A6).
         scope = resolve_scope(root, requested)
     except OSError as exc:
         raise ScopeSafetyRefusal("cannot establish maintenance scope") from exc
-    if floor is not None and scope != floor:
-        raise ScopeSafetyRefusal("cannot broaden this invocation's default-only maintenance")
     if explicit and command[:1] == ["update"] and scope.mode == "default" and (
             "--no-gateway-restart" not in command or "--gateway" in command):
         raise ScopeSafetyRefusal("default-only maintenance must run from a shell with --no-gateway-restart")
@@ -302,18 +317,26 @@ def require_scope_target(source: bytes | None) -> None:
     if current_scope().mode == "all":
         return
     import ast
+
+    def declares(tree, name: str, value: int) -> bool:
+        return any(isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+                   and isinstance(node.value, ast.Constant)
+                   and type(node.value.value) is int
+                   and node.value.value == value for node in tree.body)
     try:
         tree = ast.parse(source or b"")
-        supported = any(isinstance(node, ast.Assign)
-                        and any(isinstance(name, ast.Name) and name.id == "MAINTENANCE_SCOPE_SCHEMA"
-                                for name in node.targets)
-                        and isinstance(node.value, ast.Constant)
-                        and type(node.value.value) is int
-                        and node.value.value == MAINTENANCE_SCOPE_SCHEMA for node in tree.body)
+        supported = declares(tree, "MAINTENANCE_SCOPE_SCHEMA", MAINTENANCE_SCOPE_SCHEMA)
+        complete = supported and declares(tree, "SCOPED_OPERATION_CAPABILITY", SCOPED_OPERATION_CAPABILITY)
     except (SyntaxError, ValueError):
-        supported = False
+        supported = complete = False
     if not supported:
         raise ScopeSafetyRefusal("update target does not support default-only maintenance handoff; checkout unchanged")
+    if not complete:
+        # A6: a v1-only or A4-only target would drop the restriction after its launch tail or run the automatic
+        # every-home installer; refused before any source changes.
+        raise ScopeSafetyRefusal("update target does not support default-only maintenance across its whole "
+                                 "operation (launch lifetime and installer deferral); checkout unchanged")
 
 
 def record_scope() -> None:

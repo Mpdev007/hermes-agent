@@ -7,6 +7,12 @@ import hermes_bootstrap
 
 hermes_bootstrap.harden_import_path()
 
+# Port adaptation A6: the start-up operation (the bootstrap's launch maintenance above) ends before this
+# gateway serves its client's independent requests.
+from hermes_cli.maintenance_scope import end_launch_operation as _end_launch_operation
+
+_end_launch_operation()
+
 import json
 import logging
 import signal
