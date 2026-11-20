@@ -3,8 +3,9 @@
 The fixture supplies a topology bootstrap (native checkout join, direct child spawn), not a PM
 sync. Tracing parks the native entry before activation; the driver parks it again after the
 installed main() has returned. The error control supplies an invalid fixture plan; custody and
-error finalization stay real. The exhausted cell's audit hook is armed before the first product
-import, and its request carries the parent's bootstrap-only job record.
+error finalization stay real. The two exhausted cells arm their audit hook before the first
+product import. Only exhausted-bound's request carries the parent's bootstrap-only job record;
+exhausted-unmarked keeps the request a job refusal leaves (no record).
 """
 
 from __future__ import annotations
@@ -22,7 +23,8 @@ from ctypes import wintypes
 from pathlib import Path
 
 root, private, mode, cell = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
-AUDITED = mode == 'prepared' and cell == 'exhausted'
+EXHAUSTED = cell in ('exhausted-unmarked', 'exhausted-bound')
+AUDITED = mode == 'prepared' and EXHAUSTED
 LOCK = []  # the resolved native lock path, once the product module that names it is imported
 
 def emit(event, **data):
@@ -117,9 +119,10 @@ def owner():
                    bytecode_cache=str(private / 'bytecode'))
     if cell == 'tail-error':
         request['plan'] = {'fixture_prepared_tail_error': True}
-    if cell == 'exhausted':
+    if cell == 'exhausted-bound':
         # The record _bind_and_resume writes for a bound bootstrap, in the request the prepared child reads too.
         # It attests only the bootstrap: the prepared child must still refuse its ancestor-only join.
+        # exhausted-unmarked omits it, as _bind_and_resume's job-refusal path leaves the request.
         request[completion._UPDATE_JOB] = completion._UPDATE_JOB_BOUND
     (private / 'request.json').write_text(json.dumps(request), encoding='utf-8')
     job = lock.update_tree_job()
@@ -133,7 +136,7 @@ def bootstrap():
     completion._join_for_preparation(request)
     extra = []
     try:
-        if cell == 'exhausted':
+        if EXHAUSTED:
             fd = os.open(lock.checkout_lock_path(root), os.O_RDWR | os.O_BINARY)
             while (offset := lock._take_lease(fd)) is not None:
                 extra.append(offset)
@@ -147,7 +150,7 @@ def bootstrap():
         emit('child-exit', code=proc.returncode)
         gate('bootstrap-exit')
     finally:
-        if cell == 'exhausted':
+        if EXHAUSTED:
             for offset in extra:
                 lock._unlock(fd, offset)
             os.close(fd)

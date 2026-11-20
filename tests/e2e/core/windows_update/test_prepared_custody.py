@@ -279,8 +279,11 @@ def test_prepared_survivor_keeps_its_lease_through_the_result_and_releases_at_ex
         machine.kill_owned()
 
 
-def test_exhausted_native_leases_refuse_prepared_before_activation_or_shared_writes(installed):
-    machine, python, private, owner, bootstrap, ready = _start(installed, "exhausted")
+# Unmarked: the request _bind_and_resume leaves on a job refusal (no record). Bound: its record of a bound
+# bootstrap, which attests only that bootstrap. The prepared child must refuse the same way in both.
+@pytest.mark.parametrize("cell", ["exhausted-unmarked", "exhausted-bound"])
+def test_exhausted_native_leases_refuse_prepared_before_activation_or_shared_writes(installed, cell):
+    machine, python, private, owner, bootstrap, ready = _start(installed, cell)
     try:
         exhaustion = _event(machine, private, "bootstrap", "exhausted")
         assert exhaustion["count"] == exhaustion["slots"] == 16, exhaustion
@@ -303,8 +306,11 @@ def test_exhausted_native_leases_refuse_prepared_before_activation_or_shared_wri
         assert bootstrap.is_running() and owner.poll() is None, "the owning ancestor must remain alive"
         answer = json.loads((private / "result.json").read_text(encoding="utf-8"))
         request = json.loads((private / "request.json").read_text(encoding="utf-8"))
-        # The parent's record of a bound bootstrap reached the prepared child, and attested nothing for it.
-        assert request["update_job"] == "bound", request
+        if cell == "exhausted-bound":
+            # The parent's record of a bound bootstrap reached the prepared child, and attested nothing for it.
+            assert request["update_job"] == "bound", request
+        else:
+            assert "update_job" not in request, request
         assert answer["schema"] == 1 and answer["update_id"] == request["receipt"]["update_id"]
         assert answer["exit_code"] == 1 and answer["receipt"] is None and answer["windows_resume"] is None
         assert "no lock descriptor or lease of its own" in answer["error"], answer
@@ -316,12 +322,12 @@ def test_exhausted_native_leases_refuse_prepared_before_activation_or_shared_wri
         assert not [e for e in events if e["event"] in ("activation", "forbidden-write", "forbidden-process")], events
         assert _snapshot(machine.hermes_home) == before, "shared fixture metadata changed on refusal"
         # The owner is alive: the plain refusal names its recorded pid.
-        _contend(machine, python, private, "exhausted", acquired=False,
+        _contend(machine, python, private, cell, acquired=False,
                  holder=_event(machine, private, "owner", "spawn")["pid"])
         _signal(private, "bootstrap-exit")
         bootstrap.wait(timeout=30)
         _signal(private, "owner-exit")
         owner.wait(timeout=30)
-        _contend(machine, python, private, "exhausted", acquired=True)
+        _contend(machine, python, private, cell, acquired=True)
     finally:
         machine.kill_owned()
