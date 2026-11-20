@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -295,8 +296,16 @@ def _retry_owed_migration(record: Path, identity: str, known: dict):
 
 def maybe_run_boot_bootstrap(project_root: Path) -> None:
     """The one call boot paths use. Never raises: a bootstrap problem must
-    not stop the gateway/serve/CLI from starting."""
+    not stop the gateway/serve/CLI from starting.
+
+    Runs under the launch's validated maintenance scope (an explicit
+    ``pm install``/``update`` flag, or a pending default-only obligation for
+    any other start), so steps reaching other profiles see it. An unprovable
+    scope skips this start's maintenance and writes no record (port adaptation A3)."""
     try:
-        run_boot_bootstrap(Path(project_root))
+        from hermes_cli.maintenance_scope import maintenance_scope, resolve_launch_scope
+        root = Path(project_root)
+        with maintenance_scope(resolve_launch_scope(root, sys.argv[1:])):
+            run_boot_bootstrap(root)
     except Exception as exc:
         logger.warning("boot bootstrap failed (continuing boot): %s", exc)

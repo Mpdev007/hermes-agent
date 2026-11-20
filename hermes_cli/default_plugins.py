@@ -322,6 +322,12 @@ def step_install_default_plugins() -> dict:
     from pm.environments import dependency_home_root
     from pm.plugins_state import dependency_homes
     try:
+        from hermes_cli.maintenance_scope import current_scope
+        if current_scope().mode == "default":
+            # Port adaptation A3: default-only maintenance (an explicit scope or a pending default-only
+            # obligation, bound by maybe_run_boot_bootstrap) never reads named homes nor spawns the
+            # every-home installer. The step stays owed, so the next ordinary start runs it unchanged.
+            return {"ok": True, "skipped": "default-only maintenance", "owed": True}
         if all(fetch_policy(home) == "denied" for home in dependency_homes()):
             return {"ok": True, "skipped": "lazy-installs-disabled"}
         settled = _state(Path(dependency_home_root()), "settled")

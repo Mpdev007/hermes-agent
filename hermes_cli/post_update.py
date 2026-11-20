@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import sys
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Iterable
@@ -385,7 +386,16 @@ def main(argv: list | None = None) -> int:
         selected.extend(HOME_STEPS)
     if args.scope in ("machine", "all"):
         selected.extend(MACHINE_STEPS)
-    results = run_steps(selected)
+    # Port adaptation A3: a direct module run has no hermes_bootstrap prologue (like `python -m
+    # pm.cli`); a pending default-only obligation still scopes it, and an unprovable scope refuses.
+    from hermes_cli.maintenance_scope import ScopeSafetyRefusal, maintenance_scope, resolve_scope
+    try:
+        scope = resolve_scope(install_root())
+    except (ScopeSafetyRefusal, OSError) as exc:
+        print(f"hermes post-update: maintenance scope refused: {exc}", file=sys.stderr)
+        return 1
+    with maintenance_scope(scope):
+        results = run_steps(selected)
     failed = [name for name, res in results.items() if not res.get("ok")]
     for name, res in results.items():
         state = "ok" if res.get("ok") else f"FAILED ({res.get('error')})"
