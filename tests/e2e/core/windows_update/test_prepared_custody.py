@@ -3,7 +3,8 @@
 One disposable install, the existing install opt-in, no new runner permissions. The topology
 bootstrap uses the native preparation join and direct child creation; it does not repeat PM sync.
 The prepared interpreter calls the installed main with --prepared. Nothing replaces custody,
-activation, receipt persistence or finalization. See _prepared.py for the two trace gates.
+activation, receipt persistence or finalization. See _prepared.py for the activation trace gate
+and the exit gate after the installed main() returns.
 
 The existing test_update_lock_tree.py remains the positive contained-job control. This file
 deliberately proves the opposite topology with IsProcessInJob, rather than forcing a job refusal
@@ -141,7 +142,12 @@ def _own_lease(row: dict, lock_path: str) -> list:
     return held["lease"]
 
 
-def _contend(machine, python, private, cell, *, acquired):
+def _contend(machine, python, private, cell, *, acquired, holder=None):
+    """A separate contender's native try. A refusal counts as contention only as the plain held-lock answer
+    (no open, link, permission or lock-error reason) with the native holder classification: ``holder`` is the
+    recorded owner's pid while that owner lives, or ``"held"`` once it is gone and only a surviving lease or
+    descriptor keeps the checkout locked (``update_lock._lock_holder``)."""
+    assert acquired or holder is not None, "a refusal needs its expected native holder"
     before = len(_events(private, "contender"))
     proc = _spawn(machine, python, private, "contender", cell)
     proc.wait(timeout=30)
@@ -151,6 +157,12 @@ def _contend(machine, python, private, cell, *, acquired):
     # Popen may retain a venv launcher; the emitted pid is the native worker that tried the lock.
     assert row["acquired"] is acquired, row
     assert proc.returncode == (0 if acquired else 2), row
+    if acquired:
+        assert row["reason"] is None and row["holder"] is None and row["holder_held"] is None, row
+    elif holder == "held":
+        assert row["reason"] is None and row["holder_held"] is True and row["holder"] == 0, row
+    else:
+        assert row["reason"] is None and row["holder_held"] is False and row["holder"] == holder, row
     return row
 
 
@@ -233,11 +245,14 @@ def test_prepared_survivor_keeps_its_lease_through_the_result_and_releases_at_ex
         owner.wait(timeout=30)
         assert prepared.is_running(), "prepared process died with an uncontained bootstrap or owner"
         # Separate sibling contender, no update ancestor; only the prepared child's personal lease remains.
-        _contend(machine, python, private, cell, acquired=False)
+        _contend(machine, python, private, cell, acquired=False, holder="held")
         _signal(private, "activate")
         # Normal cell runs the real completion tail; error cell exercises its exception/finally.
         result_row = _event(machine, private, "prepared", "result", UPDATE_TIMEOUT)
         assert _own_lease(result_row, ready["held"]["path"]) == lease, result_row
+        # Parked after the installed main() returned, not inside its result writer.
+        exit_row = _event(machine, private, "prepared", "exit", UPDATE_TIMEOUT)
+        assert exit_row["pid"] == prepared.pid and _own_lease(exit_row, ready["held"]["path"]) == lease, exit_row
         answer = json.loads((private / "result.json").read_text(encoding="utf-8"))
         request = json.loads((private / "request.json").read_text(encoding="utf-8"))
         assert answer["schema"] == 1 and answer["update_id"] == request["receipt"]["update_id"]
@@ -251,8 +266,11 @@ def test_prepared_survivor_keeps_its_lease_through_the_result_and_releases_at_ex
         else:
             assert any(s["name"] == "build" and s["outcome"] == "success"
                        for s in answer["receipt"]["stages"]), answer
-            assert not any(f["step"] == "completion" for f in answer["receipt"]["followups"]), answer
-        _contend(machine, python, private, cell, acquired=False)
+            # A clean run records no follow-up at all, and then the receipt has no "followups" key.
+            assert not any(f["step"] == "completion" for f in answer["receipt"].get("followups", [])), answer
+        assert exit_row["code"] == answer["exit_code"], (exit_row, answer)
+        # While parked after main() returned: the personal lease still excludes a separate contender.
+        _contend(machine, python, private, cell, acquired=False, holder="held")
         with _worker_exit(prepared, private) as wait:
             _signal(private, "prepared-exit")
             assert wait(30) == answer["exit_code"], answer
@@ -273,12 +291,20 @@ def test_exhausted_native_leases_refuse_prepared_before_activation_or_shared_wri
         target = _target(machine, private)
         prepared = _identity(target["pid"])
         assert _under(prepared, spawn["child"]) and _under(prepared, bootstrap.pid), target
+        # The write/process audit was armed in this worker before any product module was imported.
+        armed = _event(machine, private, "prepared", "audit-armed")
+        assert armed["pid"] == prepared.pid and armed["product_loaded"] == [], armed
         row = _event(machine, private, "prepared", "result")
         assert row["pid"] == prepared.pid == target["pid"]
         assert row["held"]["join"] == "none" and row["held"]["lease"] is None, row
+        exit_row = _event(machine, private, "prepared", "exit")
+        assert exit_row["pid"] == prepared.pid and exit_row["code"] == 1, exit_row
+        assert exit_row["held"]["join"] == "none" and exit_row["held"]["lease"] is None, exit_row
         assert bootstrap.is_running() and owner.poll() is None, "the owning ancestor must remain alive"
         answer = json.loads((private / "result.json").read_text(encoding="utf-8"))
         request = json.loads((private / "request.json").read_text(encoding="utf-8"))
+        # The parent's record of a bound bootstrap reached the prepared child, and attested nothing for it.
+        assert request["update_job"] == "bound", request
         assert answer["schema"] == 1 and answer["update_id"] == request["receipt"]["update_id"]
         assert answer["exit_code"] == 1 and answer["receipt"] is None and answer["windows_resume"] is None
         assert "no lock descriptor or lease of its own" in answer["error"], answer
@@ -289,7 +315,9 @@ def test_exhausted_native_leases_refuse_prepared_before_activation_or_shared_wri
         assert any(e["event"] == "lock-open" for e in events), events
         assert not [e for e in events if e["event"] in ("activation", "forbidden-write", "forbidden-process")], events
         assert _snapshot(machine.hermes_home) == before, "shared fixture metadata changed on refusal"
-        _contend(machine, python, private, "exhausted", acquired=False)
+        # The owner is alive: the plain refusal names its recorded pid.
+        _contend(machine, python, private, "exhausted", acquired=False,
+                 holder=_event(machine, private, "owner", "spawn")["pid"])
         _signal(private, "bootstrap-exit")
         bootstrap.wait(timeout=30)
         _signal(private, "owner-exit")

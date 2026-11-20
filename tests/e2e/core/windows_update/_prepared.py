@@ -1,8 +1,10 @@
 """Stdlib driver for the installed prepared entry; never imported by the product.
 
 The fixture supplies a topology bootstrap (native checkout join, direct child spawn), not a PM
-sync. Tracing parks the native entry before activation and after the private result is written.
-The error control supplies an invalid fixture plan; custody and error finalization stay real.
+sync. Tracing parks the native entry before activation; the driver parks it again after the
+installed main() has returned. The error control supplies an invalid fixture plan; custody and
+error finalization stay real. The exhausted cell's audit hook is armed before the first product
+import, and its request carries the parent's bootstrap-only job record.
 """
 
 from __future__ import annotations
@@ -20,12 +22,52 @@ from ctypes import wintypes
 from pathlib import Path
 
 root, private, mode, cell = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
-sys.path.insert(0, str(root))
-from hermes_cli import update_completion as completion, update_lock as lock
+AUDITED = mode == 'prepared' and cell == 'exhausted'
+LOCK = []  # the resolved native lock path, once the product module that names it is imported
 
 def emit(event, **data):
     with (private / (mode + '.jsonl')).open('a', encoding='utf-8') as stream:
         stream.write(json.dumps(dict(event=event, pid=os.getpid(), **data)) + '\n')
+
+def audit(event, args):
+    # An exhaustion refusal must not attempt activation, process creation or a shared write.
+    # Opening the existing native lock read/write is necessary to try a lease, and changes no bytes;
+    # before the lock path is known (product imports) even that open counts as a shared write.
+    # A native DLL write is outside this Python audit; no external child may be started either.
+    if event in ('subprocess.Popen', 'os.system', 'os.startfile'):
+        emit('forbidden-process', audit=event)
+        raise AssertionError('refused prepared child attempted a subprocess')
+    targets = ()
+    if event == 'open':
+        path, access, flags = args
+        if (isinstance(access, str) and any(c in access for c in 'wax+')) or flags & (
+                os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
+            targets = (path,)
+    elif event in ('os.rename', 'os.link', 'os.symlink'):
+        targets = args[:2]
+    elif event in ('os.remove', 'os.rmdir', 'os.mkdir', 'os.chmod', 'os.truncate', 'os.utime'):
+        targets = args[:1]
+    shared = Path(os.environ['HERMES_HOME']).resolve()
+    for path in targets:
+        if isinstance(path, (str, bytes, os.PathLike)):
+            target = Path(os.fsdecode(path)).resolve()
+            if event == 'open' and LOCK and target == LOCK[0] and not flags & (os.O_TRUNC | os.O_APPEND):
+                emit('lock-open', flags=flags)
+                continue
+            if target == shared or shared in target.parents:
+                emit('forbidden-write', audit=event, target=str(target))
+                raise AssertionError('refused prepared child attempted a shared write')
+
+if AUDITED:
+    # Before the first product import, so an import-time process or shared write is observed too.
+    # Interpreter startup (-I -S) and this driver's own stdlib imports above precede it.
+    sys.addaudithook(audit)
+    emit('audit-armed', product_loaded=sorted(
+        name for name in sys.modules if name.split('.')[0] in ('hermes_cli', 'hermes_agent', 'pm')))
+sys.path.insert(0, str(root))
+from hermes_cli import update_completion as completion, update_lock as lock
+if AUDITED:
+    LOCK.append(lock.checkout_lock_path(root).resolve())
 
 def gate(name, timeout=180):
     deadline = time.monotonic() + timeout
@@ -75,6 +117,10 @@ def owner():
                    bytecode_cache=str(private / 'bytecode'))
     if cell == 'tail-error':
         request['plan'] = {'fixture_prepared_tail_error': True}
+    if cell == 'exhausted':
+        # The record _bind_and_resume writes for a bound bootstrap, in the request the prepared child reads too.
+        # It attests only the bootstrap: the prepared child must still refuse its ancestor-only join.
+        request[completion._UPDATE_JOB] = completion._UPDATE_JOB_BOUND
     (private / 'request.json').write_text(json.dumps(request), encoding='utf-8')
     job = lock.update_tree_job()
     proc = spawn('bootstrap')
@@ -115,7 +161,6 @@ def prepared():
          modules=dict(completion=completion.__file__, lock=lock.__file__),
          blobs={p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in paths})
     activation_file = str(root / 'pm/environments.py')
-    lock_path = lock.checkout_lock_path(root).resolve()
 
     def trace(frame, event, value):
         name, filename = frame.f_code.co_name, frame.f_code.co_filename
@@ -125,49 +170,22 @@ def prepared():
         if event == 'return' and frame.f_code is completion._write_json.__code__:
             if frame.f_locals.get('path') == result and result.exists():
                 emit('result', held=held())
-                gate('prepared-exit')
         return trace
 
-    def audit(event, args):
-        # An exhaustion refusal must not attempt activation, process creation or a shared write.
-        # Opening the existing native lock read/write is necessary to try a lease, and changes no bytes.
-        # A native DLL write is outside this Python audit; no external child may be started either.
-        if event in ('subprocess.Popen', 'os.system', 'os.startfile'):
-            emit('forbidden-process', audit=event)
-            raise AssertionError('refused prepared child attempted a subprocess')
-        targets = ()
-        if event == 'open':
-            path, access, flags = args
-            if (isinstance(access, str) and any(c in access for c in 'wax+')) or flags & (
-                    os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
-                targets = (path,)
-        elif event in ('os.rename', 'os.link', 'os.symlink'):
-            targets = args[:2]
-        elif event in ('os.remove', 'os.rmdir', 'os.mkdir', 'os.chmod', 'os.truncate', 'os.utime'):
-            targets = args[:1]
-        shared = Path(os.environ['HERMES_HOME']).resolve()
-        for path in targets:
-            if isinstance(path, (str, bytes, os.PathLike)):
-                target = Path(os.fsdecode(path)).resolve()
-                if event == 'open' and target == lock_path and not flags & (os.O_TRUNC | os.O_APPEND):
-                    emit('lock-open', flags=flags)
-                    continue
-                if target == shared or shared in target.parents:
-                    emit('forbidden-write', audit=event, target=str(target))
-                    raise AssertionError('refused prepared child attempted a shared write')
-
-    if cell == 'exhausted':
-        sys.addaudithook(audit)
     sys.settrace(trace)
     sys.argv = [str(root / 'hermes_cli/update_completion.py'), str(request), str(result), '--prepared']
     code = completion.main()
+    # Parked after the installed main() returned: a lease released on its way out shows here.
     emit('exit', code=code, held=held())
+    gate('prepared-exit')
     return code
 
 def contender():
     refusal = lock._acquire_checkout(root)
+    # holder_held: the refusal's native classification (recorded owner gone, the lock still held).
     emit('contend', acquired=refusal is None, held=held(),
-         reason=None if refusal is None else refusal.reason, holder=None if refusal is None else refusal.pid)
+         reason=None if refusal is None else refusal.reason, holder=None if refusal is None else refusal.pid,
+         holder_held=None if refusal is None else refusal.held)
     return 0 if refusal is None else 2
 
 try:
