@@ -12,9 +12,16 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import sys
 
 # Target-tree capability: understood by source updates before moving any code.
 MAINTENANCE_SCOPE_SCHEMA = 1
+
+# Port adaptation A4: the record venv_sync.relaunch_command carries into the managed-interpreter
+# child it starts (beside ``sys._hermes_relaunched``; never an environment variable, so processes
+# that child spawns are separate starts).
+RELAUNCH_SCOPE_ATTRIBUTE = "_hermes_maintenance_scope"
+RELAUNCH_SCOPE_SCHEMA = 1
 
 
 class ScopeSafetyRefusal(ValueError):
@@ -152,11 +159,66 @@ def resolve_scope(root: Path, requested=None) -> MaintenanceScope:
     return scope
 
 
+# Port adaptation A4: the default-only scope this invocation was admitted under (hermes_bootstrap's
+# preflight). Process-wide and narrowing-only: never set to all-profile, never cleared.
+_admitted: MaintenanceScope | None = None
+
+
+def _carried_scope(root: Path) -> MaintenanceScope | None:
+    """The default-only record a managed-interpreter relaunch carried into this process, validated
+    again here: exact shape, this checkout, the canonical default home and matching data roots.
+    Anything else refuses; a malformed or foreign handoff never reads as all-profile permission."""
+    carried = getattr(sys, RELAUNCH_SCOPE_ATTRIBUTE, None)
+    if carried is None:
+        return None
+    if (not isinstance(carried, dict) or set(carried) != {"schema", "root", "maintenance_scope"}
+            or type(carried["schema"]) is not int or carried["schema"] != RELAUNCH_SCOPE_SCHEMA
+            or not isinstance(carried["root"], str) or carried["root"] != str(Path(root).resolve())):
+        raise ScopeSafetyRefusal("invalid maintenance scope handoff")
+    scope = MaintenanceScope.from_dict(carried["maintenance_scope"])
+    if scope.mode != "default":
+        raise ScopeSafetyRefusal("a maintenance scope handoff can only narrow")
+    return scope
+
+
+def _invocation_floor(root: Path) -> MaintenanceScope | None:
+    """The default-only scope this invocation already validated, or None.
+
+    Its pending marker can be cleared mid-invocation (the completed tail), after which activation,
+    a relaunch and the boot entries would otherwise resolve bare argv as all-profile.
+    """
+    if _admitted is not None:
+        return _admitted
+    return _carried_scope(root)
+
+
+def admit_launch_scope(root: Path, argv: list[str]) -> MaintenanceScope:
+    """hermes_bootstrap's preflight: validate this invocation's scope once and keep a default-only
+    result for the rest of the invocation (port adaptation A4)."""
+    global _admitted
+    scope = resolve_launch_scope(root, argv)
+    if scope.mode == "default":
+        _admitted = scope
+    return scope
+
+
+def relaunch_handoff(root: Path) -> dict | None:
+    """The record a managed-interpreter relaunch into *root* carries; None for all-profile."""
+    floor = _invocation_floor(root)
+    if floor is None:
+        return None
+    floor.validate()
+    return {"schema": RELAUNCH_SCOPE_SCHEMA, "root": str(Path(root).resolve()),
+            "maintenance_scope": floor.to_dict()}
+
+
 def resolve_launch_scope(root: Path, argv: list[str]) -> MaintenanceScope:
     """Validate authority before even early recovery or a launch short-circuit.
 
-    Pending scope applies to flagless starts and repair commands as well. This
-    is stdlib-only: it must work before activation makes SDKs importable.
+    Pending scope applies to flagless starts and repair commands as well. A default-only scope
+    this invocation already validated (:func:`_invocation_floor`) still applies after its pending
+    marker is cleared, and can never be broadened. This is stdlib-only: it must work before
+    activation makes SDKs importable.
     """
     from hermes_cli._parser import command_argv
     command = command_argv(argv)
@@ -176,9 +238,19 @@ def resolve_launch_scope(root: Path, argv: list[str]) -> MaintenanceScope:
         args, _ = parser.parse_known_args(command[1:])
         requested = args.maintenance_scope
     try:
+        floor = _invocation_floor(root)
+        if floor is not None and requested is None:
+            # A flagless start keeps the scope it was admitted under. An obligation armed by
+            # another start since then is not this invocation's to discharge or widen.
+            pending = pending_scope(root)
+            if pending is not None and pending != floor:
+                raise ScopeSafetyRefusal("the pending maintenance obligation changed during this invocation")
+            requested = floor
         scope = resolve_scope(root, requested)
     except OSError as exc:
         raise ScopeSafetyRefusal("cannot establish maintenance scope") from exc
+    if floor is not None and scope != floor:
+        raise ScopeSafetyRefusal("cannot broaden this invocation's default-only maintenance")
     if explicit and command[:1] == ["update"] and scope.mode == "default" and (
             "--no-gateway-restart" not in command or "--gateway" in command):
         raise ScopeSafetyRefusal("default-only maintenance must run from a shell with --no-gateway-restart")

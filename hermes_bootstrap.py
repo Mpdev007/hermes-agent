@@ -543,10 +543,12 @@ def _settle_interrupted_update() -> None:
 # Scope is a safety precondition, not a recoverable dependency-build failure.
 # Validate it before dependency/publication repair or legacy post-swap dispatch.
 try:
-    from hermes_cli.maintenance_scope import ScopeSafetyRefusal, resolve_launch_scope
+    from hermes_cli.maintenance_scope import ScopeSafetyRefusal, admit_launch_scope, resolve_launch_scope
 
     try:
-        resolve_launch_scope(_root, sys.argv[1:])
+        # Port adaptation A4: a default-only result is admitted for this whole invocation, so the
+        # launch tail clearing its pending marker cannot widen activation, a relaunch or boot.
+        admit_launch_scope(_root, sys.argv[1:])
     except ScopeSafetyRefusal as exc:
         print(f"hermes: maintenance scope refused: {exc}", file=sys.stderr)
         raise SystemExit(1) from None

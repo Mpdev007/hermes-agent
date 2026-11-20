@@ -301,7 +301,10 @@ def maybe_run_boot_bootstrap(project_root: Path) -> None:
     Runs under the launch's validated maintenance scope (an explicit
     ``pm install``/``update`` flag, or a pending default-only obligation for
     any other start), so steps reaching other profiles see it. An unprovable
-    scope skips this start's maintenance and writes no record (port adaptation A3)."""
+    scope skips this start's maintenance and writes no record (port adaptation A3).
+    A default-only scope this invocation was admitted under still applies after
+    its launch tail cleared the pending marker, here and in a relaunched
+    managed interpreter (port adaptation A4)."""
     try:
         from hermes_cli.maintenance_scope import maintenance_scope, resolve_launch_scope
         root = Path(project_root)

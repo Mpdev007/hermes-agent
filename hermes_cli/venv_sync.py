@@ -727,6 +727,12 @@ def relaunch_command(
     # a restore re-execs sys.orig_argv and keeps it, which is why that guard re-checks currency.
     prefix = (f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
               "sys._hermes_relaunched = True; ")
+    # Port adaptation A4: the same child keeps this invocation's default-only maintenance scope
+    # (its pending marker may already be cleared). The child validates it again; all-profile
+    # launches carry nothing, so their command is unchanged.
+    from hermes_cli.maintenance_scope import RELAUNCH_SCOPE_ATTRIBUTE, relaunch_handoff
+    if (handoff := relaunch_handoff(root)) is not None:
+        prefix += f"sys.{RELAUNCH_SCOPE_ATTRIBUTE} = {handoff!r}; "
     if argv[0] == "-m" and original[index:index + 1] == ["-m"]:
         # Python is still locating the module (a package's __init__ imported the bootstrap):
         # argv[0] is "-m" and __main__ has no spec yet, so the module name is on the command line.
