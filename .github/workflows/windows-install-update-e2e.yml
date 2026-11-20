@@ -49,12 +49,14 @@ concurrency:
 jobs:
   install-update:
     name: Windows install.ps1 + hermes update E2E
-    runs-on: blacksmith-32vcpu-windows-2025
+    # Fork-only native QA branch (Mpdev007/hermes-agent wine2e-install/a7-7e): GitHub-hosted
+    # Windows runner instead of the upstream Blacksmith label, which this fork does not have.
+    runs-on: windows-2025
     # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: 75
+    timeout-minutes: 150
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           ref: ${{ inputs.commit }}
           # serve.git is a bare clone of this checkout: the installer's treeless clone and
@@ -72,8 +74,12 @@ jobs:
       - name: Run Windows install + update E2E
         shell: bash
         run: |
-          scripts/run_tests.sh tests/e2e/core/windows_update/ -- \
-            -m "platforms and integration" -v --tb=short -rA
+          # Accepted A7.7e seven-case proposal only (Hermes 48fa63c6), no other journeys.
+          scripts/run_tests.sh tests/e2e/core/windows_update/test_prepared_custody.py \
+            tests/e2e/core/windows_update/test_update_lock_tree.py -- \
+            -m "platforms and integration" \
+            -k "prepared or exhausted_native_leases or second_home_update or killed_owner or free_lock" \
+            -v --tb=short -rA
         env:
           HERMES_E2E_WINDOWS_INSTALL: '1'
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
@@ -85,7 +91,7 @@ jobs:
           HERMES_E2E_PROFILES_ROOT: C:\Users
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
           # One journey per file, all in parallel (each is mostly network + subprocess wait).
-          HERMES_TEST_WORKERS: '6'
+          HERMES_TEST_WORKERS: '1'
           # test_crash_cells.py runs its whole journey (install, gateway phase, six crash cells)
           # inside one file: ~2,100 s on a normal runner, past 2,400 s on a slow one.
           HERMES_TEST_FILE_TIMEOUT: '3600'
@@ -93,20 +99,6 @@ jobs:
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''
-
-      - name: Every crash cell ran
-        # run_tests.sh passes a file whose tests were all deselected (pytest exit 5) or skipped,
-        # so a lost marker or opt-in would run zero crash cells green. The crash journey writes
-        # this manifest only when it ran (tests/e2e/core/windows_update/test_crash_cells.py).
-        shell: pwsh
-        env:
-          HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
-        run: |
-          $manifest = Join-Path $env:HERMES_E2E_ARTIFACTS 'crash-cells-ran.txt'
-          if (-not (Test-Path -LiteralPath $manifest)) {
-            throw "test_crash_cells.py ran no crash cells: $manifest is missing"
-          }
-          Get-Content -LiteralPath $manifest
 
       - name: No machine install left behind
         if: always()
