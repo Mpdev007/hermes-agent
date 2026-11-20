@@ -346,6 +346,24 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
         return GatewayDiscovery("inaccessible", reason_code="invalid_control_peer")
 
 
+def _refuse_restricted_service_start() -> None:
+    """Port adaptation A7: a cold start of an installed gateway service under this operation's default-only
+    restriction is refused before the service manager is asked. The manager runs the unit's saved command, which no
+    validated native carrier can extend (``gateway_runtime_service_identity.verify_systemd`` admits a plain
+    ``ExecStart`` only, and the restriction is never an environment variable or a persisted unit command); dropping
+    it would let that gateway's start-up maintenance reach every profile. An ordinary start, and an owner already
+    running or starting (attached before this point), are unchanged; an unmanaged spawn carries the restriction
+    (``venv_sync.same_operation_command``)."""
+    from hermes_cli._startup_fast import project_root_str
+    from hermes_cli.gateway_runtime_service import RuntimeStartError
+    from hermes_cli.maintenance_scope import relaunch_handoff
+    if relaunch_handoff(Path(project_root_str())) is not None:
+        raise RuntimeStartError("maintenance_scope_restricted", detail=(
+            "default-only maintenance cannot start the installed gateway service: its service manager would run the "
+            "saved command without this operation's restriction. Nothing was started; start it after the "
+            "maintenance finishes."))
+
+
 def _update_fenced(homes) -> bool:
     """True while an update owns the install, judged the way main's launchers and the Desktop
     judge ``.hermes-update-in-progress``: a live (or still being written) marker, or a dead or
@@ -522,6 +540,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
                     waiting.update(dict.fromkeys([home] if observed.state == "starting" else []))
                     continue
                 if service is not None:
+                    _refuse_restricted_service_start()
                     start_existing_gateway_service(service, deadline=deadline)
                 else:
                     from hermes_cli.gateway_runtime_start import spawn_unmanaged_gateway, stdio_log_size

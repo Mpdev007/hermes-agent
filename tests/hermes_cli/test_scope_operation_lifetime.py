@@ -310,3 +310,106 @@ def test_the_locked_tail_revalidates_and_never_clears_another_owners_marker(env,
     assert venv_sync.prepare_launch(env.checkout, []) is None
     assert env.marker.read_text(encoding="utf-8") == LEGACY_ALL, "the tail cleared another owner's marker"
     assert venv_sync.clear_completion(env.checkout, expected=MaintenanceScope.select("default")) is False
+
+
+# ── A7 (Hermes eb98a565 1): a cold installed-service start under the restriction is refused before the manager ──
+
+@pytest.fixture
+def stopped_service(env, monkeypatch):
+    """``ensure_gateway_runtime`` for the default home with an installed, stopped gateway service: a descriptor and a
+    start recorder at the runtime's own seams, never a real unit or service-manager command. ``owner`` set to
+    ``ready`` is an owner already running for the home."""
+    from hermes_cli import _startup_fast, gateway_runtime, gateway_runtime_multiplex, gateway_runtime_service
+
+    state = SimpleNamespace(started=[], owner="absent",
+                            service=SimpleNamespace(kind="systemd", name="hermes-gateway-fixture.service"))
+
+    def observed(*args, **kwargs):
+        return gateway_runtime.GatewayDiscovery(state.owner)
+    monkeypatch.setattr(_startup_fast, "project_root_str", lambda: str(env.checkout))
+    monkeypatch.setattr(gateway_runtime, "_update_fenced", lambda homes: False)
+    monkeypatch.setattr(gateway_runtime, "_observe_replacing_stale", observed)
+    monkeypatch.setattr(gateway_runtime, "discover_gateway_endpoint", observed)
+    monkeypatch.setattr(gateway_runtime, "_starting_multiplexer_root", lambda home: None)
+    monkeypatch.setattr(gateway_runtime, "_awaited_root_refusal", lambda home, reserved, waiting: None)
+    monkeypatch.setattr(gateway_runtime_multiplex, "multiplexer_serves_home", lambda home: None)
+    monkeypatch.setattr(gateway_runtime_multiplex, "implied_host_root", lambda home: None)
+    monkeypatch.setattr(gateway_runtime_service, "discover_existing_gateway_service",
+                        lambda target, deadline=None: state.service)
+    monkeypatch.setattr(gateway_runtime_service, "start_existing_gateway_service",
+                        lambda service, deadline=None: state.started.append(service))
+    monkeypatch.setattr(gateway_runtime_service, "refresh_ready_owner_launcher", lambda home, observed: None)
+    state.ensure = lambda: gateway_runtime.ensure_gateway_runtime(env.root, timeout=0.3)
+    return state
+
+
+def test_a_restricted_cold_service_start_is_refused_before_the_manager_is_asked(env, stopped_service, monkeypatch):
+    _admit(monkeypatch)
+    verdict = stopped_service.ensure()
+    assert stopped_service.started == [], "the service manager was asked to start the saved command"
+    assert (verdict.state, verdict.reason_code) == ("inaccessible", "maintenance_scope_restricted")
+    assert "Nothing was started" in verdict.detail
+
+
+def test_an_ordinary_cold_service_start_is_unchanged(env, stopped_service):
+    stopped_service.ensure()
+    assert stopped_service.started == [stopped_service.service]
+
+
+def test_a_running_owner_is_attached_without_a_start_under_the_restriction(env, stopped_service, monkeypatch):
+    _admit(monkeypatch)
+    stopped_service.owner = "ready"
+    assert stopped_service.ensure().state == "ready" and stopped_service.started == []
+
+
+# ── A7 (Hermes eb98a565 3): the outer clean-tail clear keeps another owner's pending marker and attempt record ──
+
+def _outer_completion(env, monkeypatch, during_tail):
+    """``update_completion._complete_selected`` for an all-profile update of *env*'s checkout through its outer
+    clean-tail clear. The tail itself (``complete_source_checkout``) is a double that runs *during_tail* and
+    succeeds; launch files, the paused-gateway resume, the bytecode sweep and receipt stages are no-ops."""
+    from hermes_cli import (main, source_completion, update_cmd, update_cmd_config, update_completion,
+                            update_launch_files, update_receipt)
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", main.PROJECT_ROOT)
+    monkeypatch.setattr(update_cmd_config, "_LAST_SIBLING_SNAPSHOTS", update_cmd_config._LAST_SIBLING_SNAPSHOTS)
+    monkeypatch.setattr(update_completion, "_record_owed_user_action", lambda request: True)
+    monkeypatch.setattr(update_completion, "_resume_paused_before_build", lambda request: None)
+    monkeypatch.setattr(update_cmd, "_sweep_bytecode_after_update", lambda branch: None)
+    monkeypatch.setattr(update_launch_files, "refresh_launch_files", lambda: None)
+    for name in ("record_build_stage", "record_skip", "record_stage"):
+        monkeypatch.setattr(update_receipt, name, lambda *a, **k: None)
+
+    def tail(root, **kwargs):
+        during_tail()
+        return True
+    monkeypatch.setattr(source_completion, "complete_source_checkout", tail)
+    request = {"source": str(env.checkout), "sibling_snapshots": {}, "plan": None, "branch": "main",
+               "desktop": False, "assume_yes": True, "gateway_mode": False, "snapshot_id": None,
+               "pre_update_version": None, "maintenance_scope": None, "completion_message": None,
+               "no_gateway_restart": True}
+    return update_completion._complete_selected(request)
+
+
+def test_the_outer_clean_tail_keeps_another_owners_pending_marker_and_attempts(env, monkeypatch):
+    from hermes_cli import venv_sync
+    from hermes_cli.maintenance_scope import MaintenanceScope
+
+    # The bytes another (default-only) owner's arm writes, captured before this all-profile update begins.
+    venv_sync.arm_completion(env.checkout, maintenance_scope=MaintenanceScope.select("default"))
+    foreign = env.marker.read_bytes()
+    assert venv_sync.clear_completion(env.checkout)
+
+    def another_owner_arms():  # its marker and attempt record land while this update's tail runs
+        env.marker.write_bytes(foreign)
+        env.attempts.write_text("another owner's attempts\n", encoding="utf-8")
+    assert _outer_completion(env, monkeypatch, another_owner_arms) is True
+    assert env.marker.read_bytes() == foreign, "the outer clean tail cleared another owner's marker"
+    assert env.attempts.read_text(encoding="utf-8") == "another owner's attempts\n"
+
+
+def test_the_outer_clean_tail_still_clears_its_own_record(env, monkeypatch):
+    from hermes_cli import venv_sync
+
+    assert _outer_completion(env, monkeypatch, lambda: venv_sync.arm_completion(env.checkout)) is True
+    assert not env.marker.exists() and not env.attempts.exists()

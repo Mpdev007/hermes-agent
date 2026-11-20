@@ -138,16 +138,23 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
         if not profile:
             raise GatewayCreateError(f"this terminal's HERMES_HOME is not a named profile, so {where} cannot "
                                      "create from it; nothing was created")
+    from hermes_cli.default_plugins import installs_deferred
+    defer = installs_deferred()  # A5: read here, in the invocation that holds the scope
+    undiscovered = False
     if not remote or request.alias:
         try:
             endpoint = live_owner()
         except Exception:
+            undiscovered = True
             logger.debug("profile create: gateway discovery failed", exc_info=True)
     if not remote and endpoint is None:
+        if defer and undiscovered:
+            # Port adaptation A7: under default-only maintenance a failed discovery is no answer: an owner may
+            # serve this home, and a local create would bypass it. Nothing was created.
+            raise GatewayCreateError("could not tell whether a running gateway owns this profile directory, so "
+                                     "nothing was created under default-only maintenance; retry")
         return None
     from hermes_cli.gateway_client import GatewayRPCError, NOT_SENT, connect_gateway
-    from hermes_cli.default_plugins import installs_deferred
-    defer = installs_deferred()  # A5: read here, in the invocation that holds the scope
     machine = " on the gateway's machine" if remote else ""
     unknown = f"{where} may have created '{request.name}'; check `hermes profile list`{machine} before retrying"
     local = _local_profile_dir(request.name)
@@ -178,10 +185,21 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
         draining = _refusal_key(exc) == _DRAINING
         unknown_method = exc.unknown_method and exc.code in (None, -32601)
         if exc.code in _OLDER_OR_RETIRING or unknown_method or draining:
+            # Port adaptation A7: what the selected, authenticated owner refused before executing anything because
+            # it predates this request (an unknown key or method), as opposed to a retiring or draining owner.
+            predates = exc.code == 4000 or unknown_method
             if remote:
+                if defer and predates:
+                    # The restriction is never dropped, replayed without it, or sent to another destination.
+                    raise GatewayCreateError(
+                        f"{where} does not support the default-only maintenance restriction this create carries "
+                        "(unsupported); nothing was created and nothing was retried elsewhere") from exc
                 why = "is restarting; retry" if exc.code == 5035 or draining else (
                     "predates this version; update it, or unset HERMES_TUI_GATEWAY_URL to create locally")
                 raise GatewayCreateError(f"{where} cannot create profiles for this terminal (it {why})") from exc
+            if defer and not predates:
+                # Only that refusal lets a restricted create run here, keeping this process's restriction.
+                raise GatewayCreateError(f"{where} is restarting; nothing was created; retry") from exc
             return None
         refused = refusal_from(exc.data)
         if refused is not None:
@@ -196,6 +214,10 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
         if not attached or str(exc) == NOT_SENT:  # the dial, ticket or handshake failed: nothing was sent
             if remote:
                 raise GatewayCreateError(f"could not reach {where} ({type(exc).__name__})") from exc
+            if defer:
+                # A7: a failed dial, ticket, identity or protocol check is not the owner's refusal; no local create.
+                raise GatewayCreateError(f"could not reach {where} ({type(exc).__name__}); nothing was created "
+                                         "under default-only maintenance; retry") from exc
             logger.info("profile create: the running gateway is unreachable (%s); creating locally", exc)
             return None
         raise GatewayCreateError(f"lost {where} during the create ({type(exc).__name__}); {unknown}") from exc

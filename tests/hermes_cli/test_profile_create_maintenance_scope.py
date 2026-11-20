@@ -18,10 +18,8 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import json
-import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -75,10 +73,15 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(default_plugins, "default_entries", tripwire("catalog read"))
     monkeypatch.setattr(lcm, "_install_into", tripwire("per-profile install"))
     return SimpleNamespace(root=root, sibling=sibling, checkout=checkout, effects=effects,
-                           owed=root / "cache" / "default-plugins.owed",
+                           owed=root / "cache" / "default-plugins.owed.d",  # A7: one file per deferred request
                            settled=root / "cache" / "default-plugins.settled",
                            rerun=root / "cache" / "default-plugins.rerun",
                            failed=root / "cache" / "left-core-default-plugins.failed")
+
+
+def _owed(env):
+    """The install-level deferred requests standing now (A7: one file each)."""
+    return sorted(path.name for path in env.owed.iterdir()) if env.owed.is_dir() else []
 
 
 def _scope(env, source, monkeypatch):
@@ -121,12 +124,14 @@ def owning_gateway(monkeypatch):
     from hermes_cli import gateway_client, maintenance_scope, sessions_owner
     from tui_gateway import server
 
-    state = SimpleNamespace(sent=[], older=False)
+    state = SimpleNamespace(sent=[], older=False, attach_error=None, refusal=None)
     monkeypatch.setattr(sessions_owner, "live_owner", lambda: SimpleNamespace(instance_id="owner-fixture"))
 
     class Client:
         async def rpc(self, method, _timeout=None, **params):
             state.sent.append(params)
+            if state.refusal is not None:  # A7: the authenticated owner refuses
+                raise state.refusal
             if state.older and "defer_default_plugins" in params:
                 raise gateway_client.GatewayRPCError("invalid_params", code=4000)
             attribute = maintenance_scope.RELAUNCH_SCOPE_ATTRIBUTE
@@ -147,6 +152,8 @@ def owning_gateway(monkeypatch):
 
     @contextlib.asynccontextmanager
     async def connect(endpoint=None, *args, **kwargs):
+        if state.attach_error is not None:  # A7: dial, ticket, identity or protocol check fails before attaching
+            raise state.attach_error
         yield Client()
     monkeypatch.setattr(gateway_client, "connect_gateway", connect)
     return state
@@ -154,8 +161,7 @@ def owning_gateway(monkeypatch):
 
 @pytest.fixture
 def web(env, monkeypatch):
-    """The dashboard's ``POST /api/profiles`` on this home."""
-    pytest.importorskip("fastapi")
+    """The dashboard's ``POST /api/profiles`` on this home (A7: never skipped; fastapi is a core dependency)."""
     from starlette.testclient import TestClient
 
     import hermes_state
@@ -172,7 +178,7 @@ def _assert_deferred_create(env, name, before):
     assert "_default_plugins_installed" not in (profile / "config.yaml").read_text(encoding="utf-8")
     assert env.effects == [], f"automatic every-home work ran: {env.effects}"
     assert _tree(env.sibling) == before, "the create changed an unrelated profile"
-    assert env.owed.is_file(), "no durable install-level request was left"
+    assert _owed(env), "no durable install-level request was left"
     assert not env.rerun.exists() and not env.settled.exists() and not env.failed.exists()
 
 
@@ -197,10 +203,11 @@ def test_cli_creation_proceeds_and_defers_only_the_every_home_installer(env, mon
         ProfilesCreateParams.model_validate(gateway.sent[0])
 
 
-@pytest.mark.parametrize("source", ["pending", "carried", "handoff"])
+@pytest.mark.parametrize("source", ["pending"])
 def test_web_creation_proceeds_and_defers_only_the_every_home_installer(env, web, monkeypatch, source):
-    """The dashboard process's own default-only maintenance. An explicit flag scopes ``update`` / ``pm install``
-    invocations only, never the dashboard, so it reaches this route only as pending or carried scope."""
+    """A dashboard request under a genuinely pending default-only obligation (A7: a carried or admitted one ended
+    when the server began serving; see the next test). An explicit flag scopes ``update`` / ``pm install``
+    invocations only, never the dashboard."""
     before = _tree(env.sibling)
     with _scope(env, source, monkeypatch):
         response = web.post("/api/profiles", json={"name": "webfresh", "no_skills": True})
@@ -223,9 +230,12 @@ def test_an_older_owning_gateway_never_drops_the_restriction(env, owning_gateway
 
     monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "ws://127.0.0.1:9/api/ws")
     monkeypatch.setattr("hermes_cli.gateway_runtime.gateway_profile_home", lambda home: env.sibling)
-    with pytest.raises(GatewayCreateError, match="predates this version"):
+    sent = len(owning_gateway.sent)
+    with pytest.raises(GatewayCreateError, match=r"\(unsupported\); nothing was created and nothing was retried"):
         profile_provision_gateway.create_through_gateway(profile_provision.ProfileCreateRequest(
             name="byurl", no_skills=True, alias=False))
+    assert len(owning_gateway.sent) == sent + 1, "the restricted request was replayed or redirected"
+    assert owning_gateway.sent[-1].get("defer_default_plugins") is True
     assert not (env.root / "profiles" / "byurl").exists()
 
 
@@ -241,7 +251,7 @@ def test_an_ordinary_create_keeps_its_wire_and_its_installer(env, owning_gateway
     _cli_create("ordinary")
     assert "defer_default_plugins" not in owning_gateway.sent[0]
     assert launched == [["fixture-child", "hermes_cli.default_plugins"]]
-    assert not env.owed.exists() and env.rerun.exists()
+    assert not _owed(env) and env.rerun.exists()
 
 
 @pytest.mark.parametrize("source", SOURCES)
@@ -254,7 +264,7 @@ def test_the_child_and_the_installer_never_scan_under_default_only_maintenance(e
         assert default_plugins.install_and_record(wait=1.0) == {"installed": [], "owed": [], "deferred": True}
         assert default_plugins.spawn_install(env.sibling) is False
     assert env.effects == [] and _tree(env.sibling) == before
-    assert env.owed.is_file() and not env.failed.exists() and not env.settled.exists() and not env.rerun.exists()
+    assert _owed(env) and not env.failed.exists() and not env.settled.exists() and not env.rerun.exists()
 
 
 def _entry(name):
@@ -293,10 +303,10 @@ def test_a_deferred_create_after_a_settled_revision_stays_owed_until_a_later_ord
         from hermes_cli import sessions_owner
         monkeypatch.setattr(sessions_owner, "live_owner", lambda: None)
         _cli_create("late")
-        assert env.owed.is_file() and env.effects == []
+        assert len(_owed(env)) == 1 and env.effects == []
         # A same-scope retry leaves it owed, with nothing started.
         assert boot() == DEFERRED
-        assert env.owed.is_file() and env.effects == []
+        assert len(_owed(env)) == 1 and env.effects == []
     clear_completion(env.checkout)  # the obligation finished; a later independent ordinary start follows
 
     launched = []
@@ -318,9 +328,86 @@ def test_a_deferred_create_after_a_settled_revision_stays_owed_until_a_later_ord
     monkeypatch.setattr(lcm, "_install_into", install_into)
     monkeypatch.setattr(default_plugins, "default_entries", lambda: [_entry("accent-picker")])
     monkeypatch.setattr(catalog, "fetch_live_catalog", lambda **kwargs: {"entries": [{"name": "accent-picker"}]})
-    past = time.time() - 60  # written before the pass began
-    os.utime(env.owed, (past, past))
     assert default_plugins.install_and_record(wait=1.0) == {"installed": ["accent-picker"], "owed": []}
     assert installed == [("late", "accent-picker")], "the pass did not honour the existing per-profile choices"
-    assert not env.owed.exists() and env.settled.read_text(encoding="utf-8") == "a" * 40
+    assert not _owed(env) and env.settled.read_text(encoding="utf-8") == "a" * 40
     assert boot() == {"ok": True} and len(launched) == 1
+
+
+# ── A7 (Hermes a297425f): a restricted create falls back locally only on the authenticated owner's own refusal ──
+
+FAILURES = ("identity", "protocol", "unreachable", "draining", "retiring", "discovery")
+
+
+def _request(name):
+    from hermes_cli import profile_provision
+    return profile_provision.ProfileCreateRequest(name=name, no_skills=True, alias=False)
+
+
+def _fail(owning_gateway, monkeypatch, kind):
+    """The selected local owner is not reached, or answers with something other than "I predate this request"."""
+    from hermes_cli import gateway_client, sessions_owner
+
+    def discovery_fails():
+        raise OSError("discovery failed")
+    if kind == "discovery":
+        monkeypatch.setattr(sessions_owner, "live_owner", discovery_fails)
+    elif kind == "identity":
+        owning_gateway.attach_error = gateway_client.GatewayClientError("Gateway bootstrap identity changed; retry")
+    elif kind == "protocol":
+        owning_gateway.attach_error = gateway_client.GatewayClientError("Gateway protocol mismatch")
+    elif kind == "unreachable":
+        owning_gateway.attach_error = OSError("connection refused")
+    elif kind == "draining":
+        owning_gateway.refusal = gateway_client.GatewayRPCError("runtime_draining", code=4001,
+                                                                data={"reason": "runtime_draining"})
+    else:
+        owning_gateway.refusal = gateway_client.GatewayRPCError("retiring", code=5035)
+
+
+@pytest.mark.parametrize("kind", FAILURES)
+def test_a_restricted_create_never_falls_back_without_the_owners_own_refusal(env, owning_gateway, monkeypatch, kind):
+    """A failed discovery, dial, identity or protocol check and a retiring or draining owner are no refusal of the
+    request by the authenticated selected owner: nothing is created anywhere and nothing is replayed."""
+    from hermes_cli import profile_provision_gateway
+    from hermes_cli.profile_provision_gateway import GatewayCreateError
+
+    _fail(owning_gateway, monkeypatch, kind)
+    before = _tree(env.sibling)
+    with _scope(env, "carried", monkeypatch):
+        with pytest.raises(GatewayCreateError, match="nothing was created"):
+            profile_provision_gateway.create_through_gateway(_request("held"))
+    assert not (env.root / "profiles" / "held").exists() and env.effects == [] and _tree(env.sibling) == before
+    assert len(owning_gateway.sent) == (1 if kind in ("draining", "retiring") else 0)
+
+
+@pytest.mark.parametrize("kind", FAILURES)
+def test_an_ordinary_create_keeps_its_local_fallback(env, owning_gateway, monkeypatch, kind):
+    """All-profile control: the same outcomes still hand an unrestricted create to this process (``None``)."""
+    from hermes_cli import profile_provision_gateway
+
+    _fail(owning_gateway, monkeypatch, kind)
+    assert profile_provision_gateway.create_through_gateway(_request("plain")) is None
+    assert all("defer_default_plugins" not in sent for sent in owning_gateway.sent)
+
+
+def test_a_running_dashboards_later_request_takes_normal_policy(env, web, monkeypatch):
+    """Item 3: the dashboard's start-up operation ends in its real ``start_server`` before it serves, so a later
+    independent request with no pending obligation takes normal policy: the profile is made, the every-home
+    installer starts once and nothing is owed (a genuinely pending obligation still defers it: the test above)."""
+    from hermes_cli import _launchers, default_plugins, maintenance_scope, web_server
+
+    launched, served = [], []
+    monkeypatch.setattr(_launchers, "runtime_command", lambda root, module=None: ["fixture-child", module])
+    monkeypatch.setattr(default_plugins, "subprocess", SimpleNamespace(
+        DEVNULL=subprocess.DEVNULL, Popen=lambda argv, **kwargs: launched.append(argv)))
+    monkeypatch.setattr(web_server, "_start_server_runtime", lambda *a, **k: served.append(
+        (maintenance_scope._admitted, getattr(sys, maintenance_scope.RELAUNCH_SCOPE_ATTRIBUTE, None))))
+    with _scope(env, "carried", monkeypatch):
+        assert default_plugins.installs_deferred()  # the dashboard's start-up operation was restricted
+        web_server.start_server()
+        assert served == [(None, None)], "the dashboard began serving with its start-up restriction"
+        response = web.post("/api/profiles", json={"name": "later", "no_skills": True})
+    assert response.status_code == 200, response.text
+    assert (env.root / "profiles" / "later" / "config.yaml").is_file()
+    assert launched == [["fixture-child", "hermes_cli.default_plugins"]] and not _owed(env)

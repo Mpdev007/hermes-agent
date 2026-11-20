@@ -43,6 +43,7 @@ def finish_update(*, root, assume_yes, gateway_mode, pre_update_snapshot_id,
     tail_owed = any(step in TAIL_FOLLOWUPS for step, _ in owed)
     record_build_stage(owed)
     if not tail_owed:
+        from hermes_cli.maintenance_scope import current_scope
         from hermes_cli.source_stamp import write_source_stamp
         from hermes_cli.venv_sync import clear_completion
 
@@ -51,7 +52,8 @@ def finish_update(*, root, assume_yes, gateway_mode, pre_update_snapshot_id,
         except (OSError, ValueError) as exc:
             print(f"⚠ Source update completed, but the install stamp could not be written: {exc}",
                   file=sys.stderr)
-        clear_completion(Path(root))
+        # Port adaptation A7: this run's own record only (an unbound, all-profile takeover); another owner's stays.
+        clear_completion(Path(root), expected=current_scope())
     # Restart can kill this process's gateway cgroup; record its result first. The code is
     # committed, so the watcher sees success; owed work is on the receipt.
     if gateway_mode:

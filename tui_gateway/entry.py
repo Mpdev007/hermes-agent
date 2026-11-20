@@ -7,11 +7,10 @@ import hermes_bootstrap
 
 hermes_bootstrap.harden_import_path()
 
-# Port adaptation A6: the start-up operation (the bootstrap's launch maintenance above) ends before this
-# gateway serves its client's independent requests.
+# Port adaptation A6/A7: the start-up operation (the bootstrap's launch maintenance above) ends when ``main``
+# begins serving the client's independent requests, never at import: a helper import (agent build, MCP
+# discovery) inside another process's restricted operation must keep that operation's restriction.
 from hermes_cli.maintenance_scope import end_launch_operation as _end_launch_operation
-
-_end_launch_operation()
 
 import json
 import logging
@@ -329,6 +328,7 @@ def main():
     if home is None:
         _log_exit(f"refused: {server._launch_home()} is owned by a running gateway; attach to it instead")
         sys.exit(1)
+    _end_launch_operation()  # A7: this process now serves independent requests
     try:
         _serve()
     finally:

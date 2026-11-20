@@ -16,17 +16,21 @@ default settled. Nothing is fetched where ``security.allow_lazy_installs`` is of
 attempt backs the next one off (an hour, doubling to a week).
 
 Port adaptation A5: under default-only maintenance (explicit, pending or carried) none of this automatic
-every-home work starts: a create, boot, child or pass leaves one install-level request
-(``cache/default-plugins.owed``) that reopens the boot step for a later ordinary start, whose clean pass clears it.
+every-home work starts: a create, boot, child or pass leaves an install-level request
+(``cache/default-plugins.owed.d/<token>``, A7: one file per deferral) that reopens the boot step for a later ordinary
+start. A complete ordinary pass, including one where every home denies fetching, answers exactly the requests it
+captured before it read any home; requests recorded during it, and every failed, partial or deferred pass, stay owed.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import secrets
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -264,27 +268,38 @@ def installs_deferred() -> bool:
 
 
 def _owe_deferred(root: Path) -> None:
-    """Leave the one install-level request a deferral owes (``default-plugins.owed``, beside ``settled``)."""
-    owed = _state(root, "owed")
-    owed.parent.mkdir(parents=True, exist_ok=True)
-    owed.touch()
+    """Leave one install-level request for this deferral: a file of its own in ``default-plugins.owed.d`` (beside
+    ``settled``), created whole (O_EXCL) and never rewritten. Port adaptation A7: a single shared marker lost a
+    request written between a consumer's check and its unlink; a request of its own cannot be."""
+    owed = _state(root, "owed.d")
+    owed.mkdir(parents=True, exist_ok=True)
+    token = f"{time.time_ns():020d}-{os.getpid()}-{secrets.token_hex(8)}"
+    os.close(os.open(owed / token, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+
+
+def _owed_batch(root: Path) -> frozenset:
+    """The deferred requests standing now (an A5/A6 build's single ``default-plugins.owed`` counts as one). A pass
+    captures them before it enumerates any home and answers only these (:func:`_consume_owed`)."""
+    batch = {_state(root, "owed")} if _state(root, "owed").is_file() else set()
+    try:
+        batch.update(path for path in _state(root, "owed.d").iterdir() if path.is_file())
+    except FileNotFoundError:
+        pass
+    return frozenset(batch)
 
 
 def deferred_request_owed() -> bool:
     """Whether a deferred request is owed: every profile's boot then owes the default-plugin step, even on a
     revision whose record had settled (``boot_bootstrap._owed_steps``)."""
     from pm.environments import dependency_home_root
-    return _state(Path(dependency_home_root()), "owed").exists()
+    return bool(_owed_batch(Path(dependency_home_root())))
 
 
-def _consume_owed(root: Path, started: float) -> None:
-    """A clean ordinary pass answers a deferred request made before it began; one made during it stays owed."""
-    owed = _state(root, "owed")
-    try:
-        if owed.stat().st_mtime < started:
-            owed.unlink(missing_ok=True)
-    except OSError:
-        pass
+def _consume_owed(batch: frozenset) -> None:
+    """A complete ordinary pass answers exactly the requests it captured before it began (:func:`_owed_batch`);
+    any recorded since (a deferral in another process during the pass) stays owed for a later independent pass."""
+    for request in batch:
+        request.unlink(missing_ok=True)
 
 
 def spawn_install(home: Optional[Path] = None) -> bool:
@@ -351,13 +366,13 @@ def install_and_record(*, say: Callable[[str], None] = print, wait: float = 900.
     """The one coordinator (update tail and detached child): :func:`install_defaults_all_homes` again until
     no rescan was requested meanwhile (a profile created during the pass), then the outcome the boot step
     reads: a failure begins the backoff, a clean pass marks this revision settled."""
-    import time
     from hermes_cli.memory_provider_migration import _note_failure, _note_success
     from pm.environments import dependency_home_root
     root = Path(dependency_home_root())
     rerun = _state(root, "rerun")
     while True:
         started = time.time()
+        batch = _owed_batch(root)  # A7: the deferred requests this pass answers, captured before any home is read
         outcome = install_defaults_all_homes(say=say, wait=wait)
         if outcome.get("deferred") or not (rerun.exists() and rerun.stat().st_mtime >= started):
             break
@@ -373,7 +388,7 @@ def install_and_record(*, say: Callable[[str], None] = print, wait: float = 900.
     _note_success(root, _BACKOFF)
     _state(root, "settled").parent.mkdir(parents=True, exist_ok=True)
     _state(root, "settled").write_text(_identity(), encoding="utf-8")
-    _consume_owed(root, started)
+    _consume_owed(batch)
     return outcome
 
 
@@ -389,13 +404,15 @@ def step_install_default_plugins() -> dict:
             # deferred request is left as it is, so the next ordinary start runs the step unchanged.
             return {"ok": True, "skipped": "default-only maintenance", "owed": True}
         root = Path(dependency_home_root())
+        batch = _owed_batch(root)  # A7: captured before the homes are enumerated
         if all(fetch_policy(home) == "denied" for home in dependency_homes()):
             # A5: nothing may install in any home, so a deferred request is answered as an ordinary create's.
-            _state(root, "owed").unlink(missing_ok=True)
+            # A7: only the requests standing before this check; one recorded during it stays owed.
+            _consume_owed(batch)
             return {"ok": True, "skipped": "lazy-installs-disabled"}
         settled = _state(root, "settled")
         if (settled.is_file() and settled.read_text(encoding="utf-8-sig").strip() == _identity()
-                and not _state(root, "owed").exists()):  # A5: a deferred request reopens a settled revision
+                and not _owed_batch(root)):  # A5: a deferred request reopens a settled revision
             return {"ok": True}
         return {"ok": True, "spawned": spawn_install(), "owed": True}
     except (OSError, ValueError) as exc:  # unreadable profiles dir, failed spawn: still owed, retried next boot

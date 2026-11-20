@@ -456,8 +456,12 @@ def _complete_selected_scoped(request: dict) -> bool:
     tail_owed = any(step in TAIL_FOLLOWUPS for step, _ in followups)
     record_build_stage(followups)
     if not tail_owed:
+        from hermes_cli.maintenance_scope import current_scope
         from hermes_cli.venv_sync import clear_completion
-        clear_completion(root)
+        # Port adaptation A7: only this update's own completion record (the scope it ran under, bound by
+        # ``_complete_selected``); another owner's pending marker and attempt record stay for that owner, as at the
+        # inner seam (``source_completion._complete_scoped``).
+        clear_completion(root, expected=current_scope())
     # systemctl's KillMode=mixed fallback can kill this whole cgroup. Publish the
     # gateway watcher's status BEFORE that operation: the code is committed, so it is 0 unless
     # the user's own changes are still parked.
