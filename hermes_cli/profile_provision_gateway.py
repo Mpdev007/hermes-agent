@@ -147,8 +147,8 @@ def _shared_owner_endpoint(profile_home: Path):
     """Port adaptation A7.3 (Hermes fa0015f0): after native discovery reads *profile_home* absent, the other owner a
     named profile can have. A ``<root>/profiles/<name>`` home may be served by the root's shared (multiplexing) gateway,
     and discovery reads a root timeout or error as "not served" and then decides from the named home's lock alone.
-    A restricted create keeps that uncertainty: a local create needs a proven standalone profile, a valid shared reply
-    that does not serve this home, or both possible owners confirmed absent. A shared owner that serves it now is
+    A restricted create keeps that uncertainty: a local create needs a proven standalone profile, a ready and valid
+    shared root whose complete served list omits this home (A7.4), or both possible owners confirmed absent. A shared owner that serves it now is
     returned (the create goes there); anything else is a :class:`GatewayCreateError` with nothing created. Ordinary
     creates and native discovery are unchanged."""
     from hermes_cli.gateway_runtime import _canonical_home, _endpoint, _overlay_owner_home
@@ -175,18 +175,43 @@ def _shared_owner_endpoint(profile_home: Path):
     served = _endpoint(payload, home, control_home=root)
     if served.state == "ready" and served.endpoint is not None:
         return served.endpoint
-    # Only a well-formed reply that lists this home nowhere is "does not serve it". A malformed, duplicate or
-    # unnamed entry, a parked profile, or a shared owner that is starting, draining or incompatible stays uncertain.
-    profiles = payload.get("served_profiles")
-    wanted = _canonical_home(home)
-    unserved = (served.state == "inaccessible" and served.reason_code == "profile_mismatch"
-                and isinstance(profiles, list) and all(isinstance(p, dict) for p in profiles)
-                and not any(isinstance(p.get("home"), str) and _canonical_home(p["home"]) == wanted for p in profiles)
-                and not _parked_here(payload, home))
-    if unserved:
+    # Port adaptation A7.4 (Hermes 8c2c45fd finding 1): an omitted home is "does not serve it" only from an owner
+    # proven ready first. ``_endpoint`` looks the requested home up before it validates state, authority or origin,
+    # so an omitted home read ``profile_mismatch`` from ANY reply: a root starting with no rows, or draining with only
+    # its own row (the native identify producer emits both). The root's own row is validated by the same native
+    # check (gateway/run_runtime.py:196-213 and session_authorities.py:135-136 list the launch home first), then the
+    # served list must be complete and unambiguous, and the parked check still applies.
+    owner = _endpoint(payload, root, control_home=root)
+    if owner.state != "ready" or owner.endpoint is None:
+        code = _bounded_code(owner.reason_code)
+        raise GatewayCreateError(uncertain.format(f"shared_root_{owner.state}{f'_{code}' if code else ''}"))
+    if (served.state == "inaccessible" and served.reason_code == "profile_mismatch"
+            and _served_list_omits(payload.get("served_profiles"), home) and not _parked_here(payload, home)):
         return None
     code = _bounded_code(served.reason_code)
     raise GatewayCreateError(uncertain.format(f"shared_{served.state}{f'_{code}' if code else ''}"))
+
+
+def _served_list_omits(profiles, home: Path) -> bool:
+    """A7.4: a complete, unambiguous served list that names *home* nowhere. Every row is an object with a non-empty
+    ``home`` and ``profile_id`` string (the native shape, session_authorities.py:135-136) and no two rows name one
+    home; an unreadable row is no verdict."""
+    from hermes_cli.gateway_runtime import _canonical_home
+    if not isinstance(profiles, list):
+        return False
+    seen: set[str] = set()
+    for row in profiles:
+        if not (isinstance(row, dict) and isinstance(row.get("home"), str) and row["home"]
+                and isinstance(row.get("profile_id"), str) and row["profile_id"]):
+            return False
+        try:
+            canonical = _canonical_home(row["home"])
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if canonical in seen:
+            return False
+        seen.add(canonical)
+    return _canonical_home(home) not in seen
 
 
 def _parked_here(payload: dict, home: Path) -> bool:

@@ -722,6 +722,67 @@ def test_a_restricted_named_create_keeps_the_shared_owners_uncertainty(env, owni
     assert env.effects == []
 
 
+# ── A7.4 (Hermes 8c2c45fd finding 1): "does not serve it" needs a valid ready root and a complete served list ──
+
+ROOT_REPLIES = ("starting-empty", "draining-root-only", "incomplete-row", "duplicate-unrelated", "no-authority-epoch",
+                "no-session-capability", "ready-unserved", "ready-serves")
+
+
+@pytest.mark.parametrize("case", ROOT_REPLIES)
+def test_the_cli_named_create_needs_a_valid_ready_root_before_an_omission_counts(env, owning_gateway, monkeypatch,
+                                                                                 case):
+    """``hermes profile create`` from the named profile ``sibling`` under default-only maintenance (the normal CLI
+    entry). Its own owner is absent, so the root's shared gateway answers for it, over the real control socket. An
+    omitted target is "not served" only when that reply is a ready root that passes the native endpoint check for
+    its own row and lists a complete, unambiguous set of homes. A root starting with no rows, or draining with only
+    its own row (both as the native identify producer emits them), an incomplete or a duplicated unrelated row, or a
+    root without its authority epoch or session capability leaves the profile uncreated: no provision, no installer
+    effect, no create RPC (red on A7.3: each was read as "not served" and provisioned here). Positive controls: a
+    valid ready root that omits the target lets the create run here; one serving it exactly once gets the request."""
+    from hermes_cli import gateway_client, profile_provision
+
+    class Provisioned(Exception):
+        """The local create was reached (the provision itself is not under test here)."""
+
+    provisions: list[str] = []
+
+    def provision(request):
+        provisions.append(request.name)
+        raise Provisioned
+    monkeypatch.setattr(profile_provision, "provision_profile", provision)
+    env.sibling.chmod(0o700)
+    monkeypatch.setenv("HERMES_HOME", str(env.sibling))
+    payload = owning_gateway.payload
+    root_row = dict(payload["served_profiles"][0])
+    sibling, other = str(env.sibling.resolve()), str((env.root / "profiles" / "other").resolve())
+    if case == "starting-empty":
+        payload.update(state="starting", served_profiles=[], capabilities=[])  # gateway/run_runtime.py:196-199
+    elif case == "draining-root-only":
+        payload.update(state="draining")  # gateway/run_bootstrap.py:302-303
+    elif case == "incomplete-row":
+        payload["served_profiles"] = [root_row, {"home": other}]
+    elif case == "duplicate-unrelated":
+        payload["served_profiles"] = [root_row, {"profile_id": other, "home": other},
+                                      {"profile_id": other, "home": other}]
+    elif case == "no-authority-epoch":
+        del payload["authority_epoch"]
+    elif case == "no-session-capability":
+        payload["capabilities"] = []
+    elif case == "ready-serves":
+        payload["served_profiles"] = [root_row, {"profile_id": sibling, "home": sibling}]
+        # The shared owner's answer is not under test: a handler failure proves the one request reached it.
+        owning_gateway.refusal = gateway_client.GatewayRPCError("handler_failed", code=5062)
+    with _scope(env, "explicit", monkeypatch):
+        with pytest.raises(Provisioned if case == "ready-unserved" else SystemExit):
+            _cli_create("named")
+    assert provisions == (["named"] if case == "ready-unserved" else [])
+    assert owning_gateway.dialed == (["owner-fixture"] if case == "ready-serves" else [])
+    assert [sent.get("defer_default_plugins") for sent in owning_gateway.sent] == (
+        [True] if case == "ready-serves" else [])
+    assert env.effects == []
+    assert not (env.root / "profiles" / "named").exists()
+
+
 def _restricted_from_the_dispatch_reading(env, monkeypatch):
     """The caller's reading before dispatch is ordinary; the pending default-only obligation is armed just before the
     dispatcher reads again (a second reading of the same operation sees it)."""

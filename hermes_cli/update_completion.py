@@ -285,6 +285,49 @@ def settle_lost_completion(request: dict, reason: str) -> dict:
     return {"exit_code": code, "receipt": receipt, "windows_resume": None, "pm_receipt": None}
 
 
+def _checkout_custody(root: Path) -> str | None:
+    """None when this process holds the update's native checkout lock or (re)acquires it now, else the refusal.
+
+    Port adaptation A7.4 (Hermes 8c2c45fd finding 4). ``_acquire_checkout`` is the native join: a POSIX bootstrap
+    joins the descriptor its parent passed (``pass_fds``), a Windows one joins with its own lease while its update
+    ancestor lives, and either takes a lock that has since become free. A refusal (another owner holds it, or the
+    Windows lease join failed) means this process has no custody to write shared install state under.
+    """
+    from hermes_cli.update_lock import _acquire_checkout, holds_checkout_lock
+
+    if holds_checkout_lock(root):
+        return None
+    try:
+        refused = _acquire_checkout(root)
+    except OSError as exc:
+        return f"the checkout lock could not be opened ({exc.strerror or type(exc).__name__})"
+    if refused is None:
+        return None
+    return refused.reason or f"held by process {refused.pid}"
+
+
+def _report_without_custody(request: dict, result_path: Path, step: str, reason: str, refused: str) -> int:
+    """A7.4: the owed tail, reported to the parent and written nowhere else.
+
+    Without checkout custody this process writes no shared state: not the tail marker
+    (``arm_completion``'s ``durable_write_bytes`` takes no lock of its own), not the run's receipt, not the
+    gateway status. Its correlated non-zero result carries the reason; the parent, which holds the checkout for
+    the whole command, settles it as a lost completion (``update_cmd`` -> ``settle_lost_completion``: arm,
+    follow-up, terminal receipt). A parent that is gone leaves the obligation its commit armed before the swap
+    for the next launch or ``hermes update``.
+    """
+    detail = (f"{step} owed after the code was updated ({reason}); this process could not hold the update's "
+              f"checkout ({refused}), so the update's own process records the follow-up")
+    print(f"  ⚠ {detail}", flush=True)
+    try:
+        _write_json(result_path, {"schema": 1, "update_id": request["receipt"]["update_id"], "exit_code": 1,
+                                  "receipt": None, "windows_resume": None, "pm_receipt": request.get("pm_receipt"),
+                                  "error": detail})
+    except OSError as exc:  # the parent's private answer file only; nothing shared is written instead
+        print(f"  ⚠ Could not answer the update process: {exc}")
+    return 1
+
+
 def _settle_after_commit(request: dict, result_path: Path, step: str, reason: str) -> int:
     """The tree already moved, so a failure here is owed work, never a failed update (C3, A6).
 
@@ -292,7 +335,14 @@ def _settle_after_commit(request: dict, result_path: Path, step: str, reason: st
     the prepared child died without a result. The tail obligation stays armed, so the next launch
     syncs the dependencies and finishes the tail; the run's receipt is a success that names the
     follow-up, so nothing reports "still on the previous version" while the tree is new.
+
+    A7.4 (Hermes 8c2c45fd finding 4): only with the update's checkout custody (held or re-acquired). A Windows
+    bootstrap whose lease join was refused (``_prepare_scoped``) or that failed before joining reaches this from
+    ``_bootstrap``'s outer handler without it, and then only reports (``_report_without_custody``).
     """
+    refused = _checkout_custody(Path(request["source"]))
+    if refused is not None:
+        return _report_without_custody(request, result_path, step, reason, refused)
     from hermes_cli import update_receipt
     from hermes_cli.venv_sync import arm_completion
 

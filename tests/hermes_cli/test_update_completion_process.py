@@ -397,6 +397,8 @@ def test_unwritable_gateway_status_never_fails_a_settled_commit(tmp_path, monkey
     from hermes_cli import venv_sync
 
     monkeypatch.setattr(venv_sync, "arm_completion", lambda root, **kwargs: None)
+    # A7.4: this settle holds the update's checkout custody (not under test here; see the custody selectors below).
+    monkeypatch.setattr(update_completion, "_checkout_custody", lambda root: None)
     receipt = {"update_id": "u1", "outcome": "success", "finished_at": "now"}
     monkeypatch.setattr(update_completion, "_read_terminal_receipt", lambda request: receipt)
     home = tmp_path / "home-is-a-file"
@@ -407,6 +409,138 @@ def test_unwritable_gateway_status_never_fails_a_settled_commit(tmp_path, monkey
     assert update_completion._settle_after_commit(request, result, "dependencies", "pip failed") == 0
     answer = json.loads(result.read_text(encoding="utf-8-sig"))
     assert answer["exit_code"] == 0 and answer["receipt"] == receipt
+
+
+# ── A7.4 (Hermes 8c2c45fd finding 4): no shared write from a bootstrap without the update's checkout custody ──
+
+def _custody_case(tmp_path, monkeypatch):
+    """A committed tree whose bootstrap is about to settle, with every shared write it could make tripwired.
+    ``update_lock._HELD`` starts empty (a fresh bootstrap holds nothing until it joins) and the contention
+    wait is shortened; both are restored afterwards."""
+    from hermes_cli import update_lock, update_receipt, venv_sync
+
+    source, home = tmp_path / "checkout", tmp_path / "home"
+    source.mkdir()
+    home.mkdir()
+    monkeypatch.setattr(update_lock, "_HELD", None)
+    monkeypatch.setattr(update_lock, "CHECKOUT_CONTENTION_WAIT_SECONDS", 0.2)
+    writes: list[str] = []
+
+    def tripwire(name):
+        def fire(*args, **kwargs):
+            writes.append(name)
+        return fire
+    monkeypatch.setattr(venv_sync, "arm_completion", tripwire("tail marker"))
+    for name in ("resume_run_record", "record_stage", "record_followup", "finalize_pending_update_receipt"):
+        monkeypatch.setattr(update_receipt, name, tripwire(f"receipt {name}"))
+    monkeypatch.setattr(update_completion, "_resume_receipt", tripwire("receipt resume"))
+    request = {"schema": 1, "source": str(source), "home": str(home), "gateway_mode": True, "desktop": False,
+               "receipt": {"update_id": "c" * 32, "outcome": "running", "steps": []}, "pm_receipt": None}
+    return source, home, request, writes
+
+
+def _close_held_lock():
+    from hermes_cli import update_lock
+    held = update_lock._HELD
+    if held is not None and held.get("fd") is not None:
+        os.close(held["fd"])
+
+
+@pytest.mark.platforms("posix")
+def test_a_bootstrap_denied_the_checkout_writes_nothing_shared_and_answers_its_parent(tmp_path, monkeypatch, capsys):
+    """The Windows bootstrap route through its outer handler: ``_prepare`` raises the native lease-join refusal
+    (``_prepare_scoped``), and another owner really holds the checkout lock, so the settle's own native join
+    (``_checkout_custody``) is refused too. Nothing shared is written: no tail marker, no receipt write, no gateway
+    status, and the competing owner's lock bytes and hold are untouched (red on A7.3: ``_settle_after_commit``
+    armed the marker at once). The parent gets a correlated non-zero answer that names the owed step."""
+    import fcntl
+
+    from hermes_cli import update_lock
+
+    source, home, request, writes = _custody_case(tmp_path, monkeypatch)
+    lock_path = update_lock.checkout_lock_path(source)
+    lock_path.write_bytes(b'{"pid": 4242, "competing": "owner"}\n')
+    competitor = os.open(lock_path, os.O_RDWR)  # not inheritable (PEP 446): never mistaken for a passed fd
+    fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    before = lock_path.read_bytes()
+
+    def lease_refused(*args):
+        raise RuntimeError("could not join the update's checkout lock (held by process 4242)")
+    monkeypatch.setattr(update_completion, "_prepare", lease_refused)
+    result_path = tmp_path / "result.json"
+    try:
+        code = update_completion._bootstrap(request, tmp_path / "request.json", result_path)
+        assert code == 1
+        assert writes == [] and not (home / ".update_exit_code").exists()
+        assert lock_path.read_bytes() == before and update_lock._HELD is None
+        probe = os.open(lock_path, os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):  # the competitor still holds it
+                fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+    finally:
+        os.close(competitor)
+    answer = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert answer["update_id"] == request["receipt"]["update_id"]
+    assert answer["exit_code"] == 1 and answer["receipt"] is None
+    assert "could not hold the update's checkout" in answer["error"] and "dependencies owed" in answer["error"]
+    assert "could not hold the update's checkout" in capsys.readouterr().out
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("custody", ["held", "reacquired"])
+def test_a_bootstrap_with_the_checkout_still_settles_natively(tmp_path, monkeypatch, custody):
+    """Positive control: a bootstrap that holds the checkout (a joined lease or the passed descriptor) or
+    re-acquires it once it is free still makes the native post-commit settle: it arms the tail and answers
+    with its terminal receipt."""
+    from hermes_cli import update_lock
+
+    source, home, request, writes = _custody_case(tmp_path, monkeypatch)
+    if custody == "held":
+        monkeypatch.setattr(update_lock, "holds_checkout_lock", lambda root=None: True)
+    receipt = {"update_id": request["receipt"]["update_id"], "outcome": "success", "finished_at": "now"}
+    monkeypatch.setattr(update_completion, "_read_terminal_receipt", lambda request: receipt)
+    result_path = tmp_path / "result.json"
+    try:
+        assert update_completion._settle_after_commit(request, result_path, "dependencies", "pip failed") == 0
+        assert (update_lock._HELD is not None) == (custody == "reacquired")
+    finally:
+        _close_held_lock()
+    assert writes == ["tail marker"]
+    assert json.loads(result_path.read_text(encoding="utf-8-sig"))["receipt"] == receipt
+    assert (home / ".update_exit_code").read_text(encoding="utf-8").strip() == "0"
+
+
+def test_the_update_that_holds_the_checkout_settles_a_bootstrap_without_it(transition, monkeypatch, capsys):
+    """The parent's half: the real ``_report_without_custody`` answer (loaded by path in the child, exactly the
+    bytes a refused bootstrap writes) reaches the update process, which holds the checkout for the whole command.
+    It records the owed tail as a lost completion -- its own arm, one ``completion`` follow-up naming the
+    custody reason, exit 0 -- and releases the lock afterwards."""
+    from hermes_cli import update_lock, venv_sync
+
+    root, _git, _old, _new, request = transition
+    armed: list[Path] = []
+    monkeypatch.setattr(venv_sync, "arm_completion", lambda project_root, **kwargs: armed.append(Path(project_root)))
+    real = Path(update_completion.__file__).resolve()
+    (root / "hermes_cli/update_completion.py").write_text(
+        "import importlib.util, json, pathlib, sys\n"
+        f"spec = importlib.util.spec_from_file_location('refused_bootstrap', {str(real)!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "request = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))\n"
+        "raise SystemExit(module._report_without_custody(request, pathlib.Path(sys.argv[2]), 'dependencies',\n"
+        "                                                'lease refused', 'held by process 4242'))\n",
+        encoding="utf-8")
+    exit_code, receipt, out = _run_cmd_update(monkeypatch, request, capsys)
+    assert exit_code == 0, out
+    assert receipt["outcome"] == "success"
+    assert [row["step"] for row in receipt["followups"]] == ["completion"]
+    assert "could not hold the update's checkout" in receipt["followups"][0]["reason"]
+    assert armed == [root]
+    lock = update_lock.UpdateLock()
+    assert lock.acquire()
+    lock.release()
 
 
 @pytest.mark.parametrize("cleanup_failure", [None, "kill", "wait"])
