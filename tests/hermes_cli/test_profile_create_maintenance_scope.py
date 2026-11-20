@@ -653,3 +653,118 @@ def test_the_captured_restriction_governs_the_local_create_after_the_marker_clea
         _cli_create("roundtrip")
     assert [sent.get("defer_default_plugins") for sent in owning_gateway.sent] == [True]
     _assert_deferred_create(env, "roundtrip", before)  # red on A7.1: the local installer re-read the cleared marker
+
+
+# ── A7.3 (Hermes fa0015f0): a named profile's shared owner is an owner too; a restriction seen anywhere is kept ──
+
+SHARED = ("shared-timeout", "shared-starting", "shared-malformed", "shared-parked",
+          "both-absent", "standalone", "shared-unserved", "shared-serves")
+
+
+@pytest.mark.parametrize("case", SHARED)
+def test_a_restricted_named_create_keeps_the_shared_owners_uncertainty(env, owning_gateway, monkeypatch, case):
+    """From the named profile ``sibling`` (no socket of its own, its lock free, so discovery reads the direct owner
+    absent), the root's shared gateway is the other possible owner. A timeout, an active start reservation, a reply
+    that is not a well-formed "not served", or a parked entry is no verdict: nothing is created or dialed. A proven
+    standalone profile, both owners confirmed absent, or a valid reply that does not list this home lets the create
+    run here; a shared owner that serves it gets the request."""
+    import os
+
+    from hermes_cli import gateway_runtime_discovery, profile_provision_gateway
+    from hermes_cli.maintenance_scope import deferring_every_home_installs
+    from hermes_cli.profile_provision_gateway import GatewayCreateError
+
+    env.sibling.chmod(0o700)
+    monkeypatch.setenv("HERMES_HOME", str(env.sibling))
+    sibling = str(env.sibling.resolve())
+    lock = None
+    if case in ("shared-timeout", "standalone"):
+        real = gateway_runtime_discovery.query_identify
+
+        def root_times_out(home, *, timeout):
+            if Path(home).resolve() == env.root.resolve():
+                raise TimeoutError  # the shared owner's control read past its deadline
+            return real(home, timeout=timeout)
+        monkeypatch.setattr(gateway_runtime_discovery, "query_identify", root_times_out)
+        if case == "standalone":
+            (env.sibling / "config.yaml").write_text("config_version: 1\ngateway:\n  standalone: true\n")
+    elif case in ("shared-starting", "both-absent"):
+        owning_gateway.peer.stop()  # the root's socket is gone too
+        if case == "shared-starting":
+            lock = _hold_start_reservation(env)  # the ROOT's start reservation; the named lock stays absent
+    elif case == "shared-malformed":
+        owning_gateway.payload["served_profiles"] = "not-a-list"
+    elif case == "shared-parked":
+        owning_gateway.payload["parked_profiles"] = {"sibling": "unusable store"}
+    elif case == "shared-serves":
+        from hermes_cli import gateway_client
+        owning_gateway.payload["served_profiles"] = [
+            *owning_gateway.payload["served_profiles"], {"profile_id": sibling, "home": sibling}]
+        # The shared owner's answer is not under test: a handler failure proves the one request reached it.
+        owning_gateway.refusal = gateway_client.GatewayRPCError("handler_failed", code=5062)
+    try:
+        with deferring_every_home_installs(True):  # restricted (the owning gateway's carrier, A5)
+            if case in ("shared-timeout", "shared-starting", "shared-malformed", "shared-parked"):
+                with pytest.raises(GatewayCreateError, match="nothing was created under default-only maintenance"):
+                    profile_provision_gateway.create_through_gateway(_request("named"))
+            elif case == "shared-serves":
+                with pytest.raises(GatewayCreateError, match="did not finish the create"):
+                    profile_provision_gateway.create_through_gateway(_request("named"))
+            else:
+                assert profile_provision_gateway.create_through_gateway(_request("named")) is None  # created here
+    finally:
+        if lock is not None:
+            os.close(lock)
+    assert not (env.root / "profiles" / "named").exists()
+    assert owning_gateway.dialed == (["owner-fixture"] if case == "shared-serves" else [])
+    assert [sent.get("defer_default_plugins") for sent in owning_gateway.sent] == (
+        [True] if case == "shared-serves" else [])
+    assert env.effects == []
+
+
+def _restricted_from_the_dispatch_reading(env, monkeypatch):
+    """The caller's reading before dispatch is ordinary; the pending default-only obligation is armed just before the
+    dispatcher reads again (a second reading of the same operation sees it)."""
+    from hermes_cli import default_plugins
+    from hermes_cli.maintenance_scope import MaintenanceScope
+    from hermes_cli.venv_sync import arm_completion
+
+    real, calls = default_plugins.installs_deferred, []
+
+    def readings():
+        calls.append(len(calls))
+        if len(calls) == 2:
+            arm_completion(env.checkout, maintenance_scope=MaintenanceScope.select("default"))
+        return real()
+    monkeypatch.setattr(default_plugins, "installs_deferred", readings)
+    return calls
+
+
+@pytest.mark.parametrize("route", ["matched-refusal", "confirmed-absence"])
+def test_a_restriction_seen_only_by_the_dispatcher_governs_the_local_create(env, owning_gateway, monkeypatch, route):
+    """Late deferral: only the dispatcher's reading is restricted, and the obligation ends (its marker withdrawn)
+    before the local create. The create still defers and records the request owed: the dispatcher's own reading is
+    carried through ``provision_profile`` and its installer decision (red on A7.2: the CLI's ordinary reading was
+    carried and the installer re-read the cleared marker)."""
+    from hermes_cli import profile_provision_gateway
+    from hermes_cli.venv_sync import clear_completion
+
+    calls = _restricted_from_the_dispatch_reading(env, monkeypatch)
+    if route == "matched-refusal":
+        owning_gateway.refusal = _unknown_method(-32601)
+        owning_gateway.before_answer = lambda: clear_completion(env.checkout)
+    else:
+        owning_gateway.peer.stop()
+        real_owner = profile_provision_gateway._restricted_local_owner
+
+        def absent_then_withdrawn():
+            owner = real_owner()
+            clear_completion(env.checkout)  # the obligation ends before the local create
+            return owner
+        monkeypatch.setattr(profile_provision_gateway, "_restricted_local_owner", absent_then_withdrawn)
+    before = _tree(env.sibling)
+    _cli_create("late")
+    assert len(calls) >= 2
+    assert [sent.get("defer_default_plugins") for sent in owning_gateway.sent] == (
+        [True] if route == "matched-refusal" else [])
+    _assert_deferred_create(env, "late", before)

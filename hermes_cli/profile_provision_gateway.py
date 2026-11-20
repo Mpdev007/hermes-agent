@@ -137,10 +137,68 @@ def _restricted_local_owner():
     if found.state == "ready" and found.endpoint is not None:
         return found.endpoint
     if found.state == "absent":
-        return None
+        return _shared_owner_endpoint(get_hermes_home().resolve())
     code = _bounded_code(found.reason_code)
     raise GatewayCreateError(f"the gateway for this profile directory is {found.state}{f' ({code})' if code else ''}, "
                              "so nothing was created under default-only maintenance; retry")
+
+
+def _shared_owner_endpoint(profile_home: Path):
+    """Port adaptation A7.3 (Hermes fa0015f0): after native discovery reads *profile_home* absent, the other owner a
+    named profile can have. A ``<root>/profiles/<name>`` home may be served by the root's shared (multiplexing) gateway,
+    and discovery reads a root timeout or error as "not served" and then decides from the named home's lock alone.
+    A restricted create keeps that uncertainty: a local create needs a proven standalone profile, a valid shared reply
+    that does not serve this home, or both possible owners confirmed absent. A shared owner that serves it now is
+    returned (the create goes there); anything else is a :class:`GatewayCreateError` with nothing created. Ordinary
+    creates and native discovery are unchanged."""
+    from hermes_cli.gateway_runtime import _canonical_home, _endpoint, _overlay_owner_home
+    from hermes_cli.gateway_runtime_discovery import missing_owner_state, query_identify
+    from hermes_cli.gateway_runtime_multiplex import multiplexer_root_for
+    home = _overlay_owner_home(Path(_canonical_home(profile_home)))  # as discover_gateway_endpoint resolves it
+    root = multiplexer_root_for(home)
+    if root is None:
+        return None  # not a named profile: no shared owner, the direct verdict stands
+    from hermes_cli.gateway_multiplex_mode import host_serves_named_profile
+    if host_serves_named_profile(root, home) is False:
+        return None  # a proven standalone profile (gateway.standalone: true) is never served by the root
+    uncertain = ("could not tell whether the shared gateway for these profiles serves this one ({}), so nothing was "
+                 "created under default-only maintenance; retry")
+    try:
+        payload = query_identify(root, timeout=2.0)
+    except (FileNotFoundError, ConnectionRefusedError):
+        state = missing_owner_state(root)  # absent, starting (an active start reservation) or inaccessible
+        if state == "absent":
+            return None  # both possible owners confirmed absent
+        raise GatewayCreateError(uncertain.format(f"shared_{state}")) from None
+    except Exception as exc:  # health: allow BLE001 -- a timeout, refusal or invalid reply is no verdict
+        raise GatewayCreateError(uncertain.format("shared_unreadable")) from exc
+    served = _endpoint(payload, home, control_home=root)
+    if served.state == "ready" and served.endpoint is not None:
+        return served.endpoint
+    # Only a well-formed reply that lists this home nowhere is "does not serve it". A malformed, duplicate or
+    # unnamed entry, a parked profile, or a shared owner that is starting, draining or incompatible stays uncertain.
+    profiles = payload.get("served_profiles")
+    wanted = _canonical_home(home)
+    unserved = (served.state == "inaccessible" and served.reason_code == "profile_mismatch"
+                and isinstance(profiles, list) and all(isinstance(p, dict) for p in profiles)
+                and not any(isinstance(p.get("home"), str) and _canonical_home(p["home"]) == wanted for p in profiles)
+                and not _parked_here(payload, home))
+    if unserved:
+        return None
+    code = _bounded_code(served.reason_code)
+    raise GatewayCreateError(uncertain.format(f"shared_{served.state}{f'_{code}' if code else ''}"))
+
+
+def _parked_here(payload: dict, home: Path) -> bool:
+    """Whether the shared owner names this home among the profiles it could not serve (``parked_profiles``)."""
+    from hermes_cli.profiles import normalize_profile_name
+    parked = payload.get("parked_profiles")
+    if parked is None:
+        return False
+    if not isinstance(parked, dict):
+        return True  # malformed: unproven, so uncertain
+    name = normalize_profile_name(home.name)
+    return any(normalize_profile_name(str(n)) == name for n in parked)
 
 
 async def _described_instance(client) -> Optional[str]:
@@ -154,8 +212,33 @@ async def _described_instance(client) -> Optional[str]:
     return instance if isinstance(instance, str) and instance else None
 
 
+def create_or_provision(request: ProfileCreateRequest, provision) -> ProfileCreateReceipt:
+    """The profile create the CLI runs: the owning gateway's (:func:`create_through_gateway`), else *provision*
+    (``profile_provision.provision_profile``) here.
+
+    Port adaptation A7.3 (Hermes fa0015f0): a restriction observed by either reading of this one operation (the
+    caller's, before dispatch, or the dispatcher's own) holds through the local provision and its installer decision,
+    so it cannot be lost when the pending obligation ends during the round trip. A restriction armed later still
+    applies (``default_plugins.installs_deferred`` keeps reading it). One dispatch, no retry."""
+    from hermes_cli.default_plugins import installs_deferred
+    from hermes_cli.maintenance_scope import deferring_every_home_installs
+    observation: dict = {}
+    with deferring_every_home_installs(installs_deferred()):
+        made = _dispatch_create(request, observation)
+        if made is not None:
+            return made
+        with deferring_every_home_installs(observation.get("deferred") is True):
+            return ProfileCreateReceipt.of(request, provision(request))
+
+
 def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCreateReceipt]:
-    """The receipt of the gateway's create for *request*, or None to create here.
+    """:func:`_dispatch_create` without reporting its deferral reading (callers that only dispatch)."""
+    return _dispatch_create(request, {})
+
+
+def _dispatch_create(request: ProfileCreateRequest, observation: dict) -> Optional[ProfileCreateReceipt]:
+    """The receipt of the gateway's create for *request*, or None to create here. Its own deferral reading is put in
+    ``observation["deferred"]`` before any owner is chosen (A7.3: :func:`create_or_provision` carries it).
 
     ``HERMES_TUI_GATEWAY_URL`` set: that gateway makes the profile, in this terminal's profile, and anything
     short of its answer is a :class:`GatewayCreateError`, never a local create. Otherwise a live gateway for
@@ -177,9 +260,10 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
             raise GatewayCreateError(f"this terminal's HERMES_HOME is not a named profile, so {where} cannot "
                                      "create from it; nothing was created")
     from hermes_cli.default_plugins import installs_deferred
-    # A5: read here, in the invocation that holds the scope; A7.2: ``profile_cmd`` carries this same answer across
-    # a local create, so a pending obligation that ends during the round trip cannot widen it.
+    # A5: read here, in the invocation that holds the scope; A7.3: reported to :func:`create_or_provision`, which
+    # carries it (or the caller's earlier reading) across a local create and its installer decision.
     defer = installs_deferred()
+    observation["deferred"] = defer
     if not remote and defer:
         endpoint = _restricted_local_owner()  # None only for confirmed absence
     elif not remote or request.alias:

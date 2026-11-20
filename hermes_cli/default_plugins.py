@@ -24,9 +24,11 @@ captured before it read any home; requests recorded during it, and every failed,
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import secrets
+import stat
 import subprocess
 import sys
 import threading
@@ -278,14 +280,32 @@ def _owe_deferred(root: Path) -> None:
 
 
 def _owed_batch(root: Path) -> frozenset:
-    """The deferred requests standing now (an A5/A6 build's single ``default-plugins.owed`` counts as one). A pass
-    captures them before it enumerates any home and answers only these (:func:`_consume_owed`)."""
-    batch = {_state(root, "owed")} if _state(root, "owed").is_file() else set()
+    """The deferred requests a pass may answer: the regular files standing now in ``default-plugins.owed.d``, each
+    created whole under a name of its own and never rewritten (:func:`_owe_deferred`, or an A5/A6 build's marker
+    claimed by :func:`_claimed_batch`). A pass captures them before it enumerates any home and answers only these
+    (:func:`_consume_owed`).
+
+    Port adaptation A7.3 (Hermes fa0015f0): the A5/A6 shared name ``default-plugins.owed`` is never part of a batch.
+    An A5/A6 writer may recreate it after a claim (and re-stamp it during a scan); that is a later request, and
+    unlinking the shared name would drop it. It still counts as owed (:func:`_owed_present`)."""
+    batch = set()
     try:
-        batch.update(path for path in _state(root, "owed.d").iterdir() if path.is_file())
+        entries = list(_state(root, "owed.d").iterdir())
     except FileNotFoundError:
-        pass
+        return frozenset()
+    for path in entries:
+        try:
+            if stat.S_ISREG(path.lstat().st_mode):  # never a link: only the request files themselves
+                batch.add(path)
+        except FileNotFoundError:  # answered by another pass meanwhile
+            continue
     return frozenset(batch)
+
+
+def _owed_present(root: Path) -> bool:
+    """Whether any deferred request is owed: a per-request file, or an A5/A6 build's shared marker (detection only;
+    it is claimed into ``owed.d`` before a pass may answer it)."""
+    return _state(root, "owed").is_file() or bool(_owed_batch(root))
 
 
 def _claimed_batch(root: Path) -> frozenset:
@@ -309,7 +329,43 @@ def deferred_request_owed() -> bool:
     """Whether a deferred request is owed: every profile's boot then owes the default-plugin step, even on a
     revision whose record had settled (``boot_bootstrap._owed_steps``)."""
     from pm.environments import dependency_home_root
-    return bool(_owed_batch(Path(dependency_home_root())))
+    return _owed_present(Path(dependency_home_root()))
+
+
+@contextlib.contextmanager
+def _settlement_order():
+    """Port adaptation A7.3 (Hermes fa0015f0): one cross-process order between arming default-only maintenance and a
+    pass's decision to settle what it captured, held only around that decision and its publication.
+
+    Every default-only obligation is armed by an update that holds the checkout lock (``update_lock.UpdateLock``,
+    taken checkout-first by ``source_completion`` and ``hermes update``). The settling pass takes the same lock across
+    its final scope read, the settled record and the consumption of its batch: an obligation armed first is seen
+    there and the batch is kept; a pass that decides first has published before that update can arm. A pass inside
+    the update's own process (its maintenance tail) or one it started with the lock inherited joins the hold. Yields
+    False when another holder keeps the lock past the native contention wait, or the lock cannot be taken: the
+    caller then settles nothing and keeps its batch owed for a later ordinary pass. While held, this short claim reads
+    as an update in progress (``update_lock.update_in_progress``) and names this process in the lock record."""
+    from hermes_cli import update_lock
+    from hermes_cli.update_lock import _acquire_checkout, _release_checkout
+    from pm.paths import install_root
+    root = Path(install_root())
+    held = getattr(update_lock, "_HELD", None)
+    if held is not None and held["path"] != str(update_lock.checkout_lock_path(root)):
+        # This process holds another checkout's lock; ``_acquire_checkout`` keeps one record per process, so taking
+        # this one would replace it. Settle nothing here.
+        yield False
+        return
+    try:
+        refused = _acquire_checkout(root)
+    except OSError:
+        refused = True
+    if refused is not None:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        _release_checkout()
 
 
 def _consume_owed(batch: frozenset) -> None:
@@ -393,23 +449,28 @@ def install_and_record(*, say: Callable[[str], None] = print, wait: float = 900.
         outcome = install_defaults_all_homes(say=say, wait=wait)
         if outcome.get("deferred") or not (rerun.exists() and rerun.stat().st_mtime >= started):
             break
-    if not outcome.get("deferred") and installs_deferred():
-        # Port adaptation A7.2: only a complete pass that is STILL ordinary settles its batch. Scope that became
-        # default-only (or unprovable) after the pass's last per-home check leaves every captured request owed.
-        outcome = {**outcome, "deferred": True}
+    if not outcome.get("deferred") and not outcome["owed"]:
+        # Port adaptation A7.2: only a complete pass that is STILL ordinary settles its batch. A7.3: that last scope
+        # read, the settled record and the consumption are one step against arming (:func:`_settlement_order`).
+        with _settlement_order() as ordered:
+            if ordered and not installs_deferred():
+                _note_success(root, _BACKOFF)
+                _state(root, "settled").parent.mkdir(parents=True, exist_ok=True)
+                _state(root, "settled").write_text(_identity(), encoding="utf-8")
+                _consume_owed(batch)
+                return outcome
+        # Default-only (or unprovable) scope came first, or the order could not be taken: nothing is settled and
+        # every captured request stays owed for a later ordinary pass.
+        outcome = {**outcome, "deferred": True, **({} if ordered else {"settlement": "order_unavailable"})}
+    elif not outcome.get("deferred") and installs_deferred():
+        outcome = {**outcome, "deferred": True}  # A7.2: a failed pass that ended restricted is deferred, not failed
     if outcome.get("deferred"):
         # Port adaptation A5: deferred, not failed: no backoff and nothing settled; the request stays owed.
         _owe_deferred(root)
         return outcome
-    if outcome["owed"]:
-        _note_failure(root, _BACKOFF)
-        # A later pass (a profile created after this revision settled) can fail too: owed again.
-        _state(root, "settled").unlink(missing_ok=True)
-        return outcome
-    _note_success(root, _BACKOFF)
-    _state(root, "settled").parent.mkdir(parents=True, exist_ok=True)
-    _state(root, "settled").write_text(_identity(), encoding="utf-8")
-    _consume_owed(batch)
+    _note_failure(root, _BACKOFF)
+    # A later pass (a profile created after this revision settled) can fail too: owed again.
+    _state(root, "settled").unlink(missing_ok=True)
     return outcome
 
 
@@ -427,16 +488,20 @@ def step_install_default_plugins() -> dict:
         root = Path(dependency_home_root())
         batch = _claimed_batch(root)  # A7: captured before the homes are enumerated
         if all(fetch_policy(home) == "denied" for home in dependency_homes()):
-            if installs_deferred():
-                # A7.2: the scan only answers for a scope that was still ordinary when it finished listing the homes.
-                return {"ok": True, "skipped": "default-only maintenance", "owed": True}
-            # A5: nothing may install in any home, so a deferred request is answered as an ordinary create's.
-            # A7: only the requests standing before this check; one recorded during it stays owed.
-            _consume_owed(batch)
-            return {"ok": True, "skipped": "lazy-installs-disabled"}
+            # A7.2: the scan only answers for a scope that was still ordinary when it finished listing the homes.
+            # A7.3: that read and the consumption are one step against arming (:func:`_settlement_order`).
+            with _settlement_order() as ordered:
+                if ordered and not installs_deferred():
+                    # A5: nothing may install in any home, so a deferred request is answered as an ordinary
+                    # create's. A7: only the requests standing before this check; one recorded during it stays owed.
+                    _consume_owed(batch)
+                    return {"ok": True, "skipped": "lazy-installs-disabled"}
+            if not ordered:
+                return {"ok": True, "skipped": "settlement order unavailable", "owed": True}
+            return {"ok": True, "skipped": "default-only maintenance", "owed": True}
         settled = _state(root, "settled")
         if (settled.is_file() and settled.read_text(encoding="utf-8-sig").strip() == _identity()
-                and not _owed_batch(root)):  # A5: a deferred request reopens a settled revision
+                and not _owed_present(root)):  # A5: a deferred request (A7.3: or a legacy marker) reopens it
             return {"ok": True}
         return {"ok": True, "spawned": spawn_install(), "owed": True}
     except (OSError, ValueError) as exc:  # unreadable profiles dir, failed spawn: still owed, retried next boot

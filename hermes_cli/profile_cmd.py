@@ -193,8 +193,8 @@ def _refuse_create_args(args, clone_from: Optional[str], cloned: bool) -> None:
 
 
 def _profile_create(args):
-    from hermes_cli.profile_provision import CREATE_REFUSALS, ProfileCreateReceipt, ProfileCreateRequest, provision_profile
-    from hermes_cli.profile_provision_gateway import GatewayCreateError, create_through_gateway
+    from hermes_cli.profile_provision import CREATE_REFUSALS, ProfileCreateRequest, provision_profile
+    from hermes_cli.profile_provision_gateway import GatewayCreateError, create_or_provision
     from hermes_cli.profiles import _get_wrapper_dir, _is_wrapper_dir_in_path
     name = args.profile_name
     clone = getattr(args, "clone", False)
@@ -213,15 +213,12 @@ def _profile_create(args):
         alias=not no_alias, quiet=False,
         mirror_credentials=not getattr(args, "no_credentials", False),
         share_auth=not getattr(args, "isolated_auth", False))
-    from hermes_cli.default_plugins import installs_deferred
-    from hermes_cli.maintenance_scope import deferring_every_home_installs
     try:
         # A gateway serving this terminal makes the profile (one HERMES_TUI_GATEWAY_URL names always
         # does); with none it is made here. Either way the receipt below is read where it was made.
-        # Port adaptation A7.2: the deferral is read once, before dispatch, and carried through a local create and
-        # its installer decision, so a pending obligation that ends during the gateway round trip cannot widen it.
-        with deferring_every_home_installs(installs_deferred()):
-            made = create_through_gateway(request) or ProfileCreateReceipt.of(request, provision_profile(request))
+        # Port adaptation A7.3: a restriction seen before dispatch or by the dispatcher is carried through a local
+        # create and its installer decision (``create_or_provision``).
+        made = create_or_provision(request, provision_profile)
     except (*CREATE_REFUSALS, GatewayCreateError) as e:
         _die(f"Error: {e}")
     print(f"\nProfile '{name}' created at {made.path}")

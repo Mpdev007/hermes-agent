@@ -219,3 +219,193 @@ def test_a_legacy_request_written_during_a_pass_is_not_lost(env, monkeypatch):
     monkeypatch.setattr(default_plugins, "install_defaults_all_homes", lambda **kwargs: dict(CLEAN))
     assert default_plugins.install_and_record(wait=1.0) == CLEAN
     assert not env.legacy.exists() and not default_plugins.deferred_request_owed()
+
+
+# ── A7.3 (Hermes fa0015f0): only immutable per-request files are consumable; settling is ordered against arming ──
+
+def test_a_legacy_marker_recreated_between_the_claim_and_the_enumeration_survives(env, monkeypatch):
+    """The pass claims the earlier build's marker (rename into ``owed.d``); an A5/A6 writer recreates the shared name
+    before the batch is enumerated and re-stamps it during the scan. The recreated marker is a later request: it is
+    never in the batch, survives the pass and settles on the next ordinary pass (red on A7.2: the enumeration took the
+    shared name and the pass unlinked it)."""
+    from hermes_cli import default_plugins
+
+    env.legacy.parent.mkdir(parents=True)
+    env.legacy.touch()
+    real_batch, recreated = default_plugins._owed_batch, []
+
+    def enumerate_after_a_recreation(root):
+        if not recreated:
+            assert not env.legacy.exists(), "the claim did not rename the shared marker first"
+            _legacy_write_in_another_process(env)  # between the rename and the enumeration
+            recreated.append(True)
+        return real_batch(root)
+
+    def scan_with_an_update(**kwargs):
+        _legacy_write_in_another_process(env)  # the same writer re-stamps it while the pass scans
+        return dict(CLEAN)
+    monkeypatch.setattr(default_plugins, "_owed_batch", enumerate_after_a_recreation)
+    monkeypatch.setattr(default_plugins, "install_defaults_all_homes", scan_with_an_update)
+    assert default_plugins.install_and_record(wait=1.0) == CLEAN
+    assert env.legacy.is_file() and _owed(env) == [], "the later request was consumed, or the claimed one stayed"
+    assert default_plugins.deferred_request_owed()
+    monkeypatch.setattr(default_plugins, "_owed_batch", real_batch)
+    monkeypatch.setattr(default_plugins, "install_defaults_all_homes", lambda **kwargs: dict(CLEAN))
+    assert default_plugins.install_and_record(wait=1.0) == CLEAN
+    assert not env.legacy.exists() and _owed(env) == [] and not default_plugins.deferred_request_owed()
+
+
+def test_a_legacy_marker_created_after_a_pass_found_none_survives(env, monkeypatch):
+    """No earlier marker when the pass begins; an A5/A6 writer creates one during it. It stays owed, reopens the
+    settled revision for the boot step, and the next ordinary pass settles it."""
+    from hermes_cli import default_plugins
+
+    def scan_with_a_new_legacy_request(**kwargs):
+        _legacy_write_in_another_process(env)
+        return dict(CLEAN)
+    monkeypatch.setattr(default_plugins, "install_defaults_all_homes", scan_with_a_new_legacy_request)
+    assert default_plugins.install_and_record(wait=1.0) == CLEAN
+    assert env.settled.read_text(encoding="utf-8") == "a" * 40 and env.legacy.is_file()
+    assert default_plugins.deferred_request_owed()
+    monkeypatch.setattr(default_plugins, "install_defaults_all_homes", lambda **kwargs: dict(CLEAN))
+    assert default_plugins.install_and_record(wait=1.0) == CLEAN
+    assert not env.legacy.exists() and not default_plugins.deferred_request_owed()
+
+
+_ARMER = r"""
+import json, sys, time
+from pathlib import Path
+from hermes_cli.maintenance_scope import MaintenanceScope
+from hermes_cli.update_lock import _acquire_checkout, _release_checkout
+from hermes_cli.venv_sync import arm_completion
+mode, checkout, signal, go, observed, owed, settled = sys.argv[1], *map(Path, sys.argv[2:8])
+deadline = time.monotonic() + 60
+signal.write_text("trying")
+while _acquire_checkout(checkout) is not None:  # an update waiting for the checkout lock (source_completion)
+    if time.monotonic() > deadline:
+        raise SystemExit(2)
+    time.sleep(0.05)
+observed.write_text(json.dumps({"settled": settled.is_file(),
+                                "owed": sorted(p.name for p in owed.iterdir()) if owed.is_dir() else []}))
+signal.write_text("held")
+while mode == "hold" and not go.exists():  # the update keeps the lock until the test lets it go on
+    if time.monotonic() > deadline:
+        raise SystemExit(2)
+    time.sleep(0.05)
+arm_completion(checkout, maintenance_scope=MaintenanceScope.select("default"))
+_release_checkout()
+"""
+
+
+def _armer(env, tmp_path, mode):
+    """A second process that arms default-only maintenance as an update does: under the checkout lock. ``hold``:
+    it takes the lock at once and keeps it until ``go``; ``wait``: it waits for the lock, records what it sees the
+    moment it gets it (settled record, owed files), then arms."""
+    files = SimpleNamespace(signal=tmp_path / f"armer-{mode}.signal", go=tmp_path / f"armer-{mode}.go",
+                            observed=tmp_path / f"armer-{mode}.json")
+    files.process = subprocess.Popen(
+        [sys.executable, "-c", _ARMER, mode, str(env.checkout), str(files.signal), str(files.go), str(files.observed),
+         str(env.owed), str(env.settled)],
+        cwd=REPO, env={**os.environ, "PYTHONPATH": str(REPO), "PYTHONDONTWRITEBYTECODE": "1"})
+    return files
+
+
+def _await(path, text, timeout=60.0):
+    import time
+    deadline = time.monotonic() + timeout
+    while not (path.is_file() and path.read_text() == text):
+        assert time.monotonic() < deadline, f"second process never reached {text!r}"
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("route", ["clean-pass", "all-denied"])
+def test_an_update_arming_first_keeps_the_batch(env, monkeypatch, tmp_path, route):
+    """Restriction first: an update holds the checkout lock (about to arm) when the pass reaches its decision. The
+    pass cannot take the order, settles nothing and keeps every captured request; once the update has armed and
+    ended, a later ordinary pass settles them."""
+    import json
+
+    from hermes_cli import default_plugins
+    from hermes_cli.venv_sync import clear_completion
+
+    if route == "all-denied":
+        (env.root / "config.yaml").write_text("config_version: 1\nsecurity:\n  allow_lazy_installs: false\n")
+    default_plugins._owe_deferred(env.root)
+    captured = _owed(env)
+    armer, real_policy = [], default_plugins.fetch_policy
+
+    def update_takes_the_lock():
+        if not armer:
+            armer.append(_armer(env, tmp_path, "hold"))
+            _await(armer[0].signal, "held")
+    if route == "clean-pass":
+        def pass_then_lock(**kwargs):
+            update_takes_the_lock()
+            return dict(CLEAN)
+        monkeypatch.setattr(default_plugins, "install_defaults_all_homes", pass_then_lock)
+        assert default_plugins.install_and_record(wait=1.0) == {
+            **CLEAN, "deferred": True, "settlement": "order_unavailable"}
+    else:
+        def policy_then_lock(home):
+            update_takes_the_lock()
+            return real_policy(home)
+        monkeypatch.setattr(default_plugins, "fetch_policy", policy_then_lock)
+        assert default_plugins.step_install_default_plugins() == {
+            "ok": True, "skipped": "settlement order unavailable", "owed": True}
+    assert set(captured) <= set(_owed(env)) and not env.settled.exists()
+    armer[0].go.touch()
+    assert armer[0].process.wait(timeout=60) == 0
+    assert json.loads(armer[0].observed.read_text())["settled"] is False
+    clear_completion(env.checkout)  # the update's default-only work finished; an ordinary pass follows
+    if route == "clean-pass":
+        monkeypatch.setattr(default_plugins, "install_defaults_all_homes", lambda **kwargs: dict(CLEAN))
+        assert default_plugins.install_and_record(wait=1.0) == CLEAN
+    else:
+        monkeypatch.setattr(default_plugins, "fetch_policy", real_policy)
+        assert default_plugins.step_install_default_plugins() == {"ok": True, "skipped": "lazy-installs-disabled"}
+    assert _owed(env) == []
+
+
+@pytest.mark.parametrize("route", ["clean-pass", "all-denied"])
+def test_a_pass_deciding_first_publishes_before_the_update_can_arm(env, monkeypatch, tmp_path, route):
+    """Pass first: the pass holds the order across its decision; an update that wants to arm waits for the checkout
+    lock. When it gets it, the pass's settlement is already published (clean pass: settled record written) and the
+    captured batch consumed; the update arms after that, and the next pass is deferred, leaving new work owed."""
+    import json
+    import time
+
+    from hermes_cli import default_plugins
+
+    if route == "all-denied":
+        (env.root / "config.yaml").write_text("config_version: 1\nsecurity:\n  allow_lazy_installs: false\n")
+    default_plugins._owe_deferred(env.root)
+    captured = _owed(env)
+    armer = []
+    real_consume = default_plugins._consume_owed
+
+    def consume_while_an_update_waits(batch):
+        # Inside the order, after the final scope read: the update starts and blocks on the lock meanwhile.
+        armer.append(_armer(env, tmp_path, "wait"))
+        _await(armer[0].signal, "trying")
+        time.sleep(0.5)
+        assert not armer[0].observed.exists(), "the update took the order inside the pass's decision"
+        real_consume(batch)
+    monkeypatch.setattr(default_plugins, "_consume_owed", consume_while_an_update_waits)
+    if route == "clean-pass":
+        monkeypatch.setattr(default_plugins, "install_defaults_all_homes", lambda **kwargs: dict(CLEAN))
+        assert default_plugins.install_and_record(wait=1.0) == CLEAN
+    else:
+        assert default_plugins.step_install_default_plugins() == {"ok": True, "skipped": "lazy-installs-disabled"}
+    assert armer[0].process.wait(timeout=60) == 0
+    seen = json.loads(armer[0].observed.read_text())
+    assert not set(captured) & set(seen["owed"]), "the update armed before the pass consumed its batch"
+    assert seen["settled"] is (route == "clean-pass")
+    monkeypatch.setattr(default_plugins, "_consume_owed", real_consume)
+    default_plugins._owe_deferred(env.root)  # new work after the update armed
+    later = _owed(env)
+    if route == "clean-pass":
+        assert default_plugins.install_and_record(wait=1.0)["deferred"] is True
+    else:
+        assert default_plugins.step_install_default_plugins() == {
+            "ok": True, "skipped": "default-only maintenance", "owed": True}
+    assert set(later) <= set(_owed(env))
