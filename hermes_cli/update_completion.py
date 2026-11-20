@@ -36,6 +36,26 @@ def _write_bootstrap_result(request: dict, result_path: Path, code: int, receipt
     return code
 
 
+# A7.5 (Hermes cfadb94a): the request field the parent sets, before the child runs, when its job took the child.
+_UPDATE_JOB, _UPDATE_JOB_BOUND = "update_job", "bound"
+
+
+def _checkout_join(root: Path) -> str:
+    """How this process holds the update's checkout lock, from the native record (``update_lock._HELD``).
+
+    ``"own"``: a descriptor it locked or inherited (POSIX ``pass_fds``), or a Windows lease byte of its own (R5b);
+    either keeps the checkout busy until this process exits. ``"ancestor"``: a Windows join that rests on its live
+    update ancestor alone (``fd=None, lease=None``, every lease byte taken; ``update_lock._acquire_checkout``).
+    ``"none"``: no join of this checkout.
+    """
+    from hermes_cli import update_lock
+
+    if not update_lock.holds_checkout_lock(root):
+        return "none"
+    held = update_lock._HELD
+    return "own" if held["fd"] is not None or held.get("lease") else "ancestor"
+
+
 def _bind_and_resume(proc: subprocess.Popen, request: dict, request_path: Path) -> None:
     """Windows: bind the suspended completion child to the update's job, then resume it.
 
@@ -49,6 +69,14 @@ def _bind_and_resume(proc: subprocess.Popen, request: dict, request_path: Path) 
     from hermes_cli.update_lock import bind_child_to_update_tree, resume_suspended_child
 
     refusal = bind_child_to_update_tree(proc)
+    if refusal is None and _checkout_join(Path(request["source"])) == "own":
+        # A7.5 (Hermes cfadb94a): the one positive record that the child dies with this process, written before it
+        # runs. Only with it does the child take a join through its ancestor, without a lease of its own, as
+        # custody. A binder that itself only joined through an ancestor fences nothing, so it records none.
+        try:
+            _write_json(request_path, {**request, _UPDATE_JOB: _UPDATE_JOB_BOUND})
+        except OSError as exc:  # the child then counts itself outside the job: its own lease or nothing
+            print(f"  ⚠ Update completion: could not record the completion child's job binding ({exc})")
     if refusal is not None:
         detail = (f"the update's job would not take the completion child ({refusal}), so it runs "
                   "outside the job, holding its own checkout lease")
@@ -285,25 +313,71 @@ def settle_lost_completion(request: dict, reason: str) -> dict:
     return {"exit_code": code, "receipt": receipt, "windows_resume": None, "pm_receipt": None}
 
 
-def _checkout_custody(root: Path) -> str | None:
-    """None when this process holds the update's native checkout lock or (re)acquires it now, else the refusal.
+_JOIN_WITHOUT_CUSTODY = {
+    "ancestor": ("it joined the checkout only through its live update ancestor, with no lock descriptor or lease of "
+                 "its own, outside the update's job"),
+    "none": "it holds no join of the checkout",
+}
+
+
+def _join_without_custody(request: dict) -> str | None:
+    """None when this process's checkout join fences its own writes, else why not (A7.5, Hermes cfadb94a).
+
+    A descriptor or lease of its own fences them. A join through the ancestor alone does only while this process
+    dies with that ancestor, i.e. inside the update's kill-on-close job, which this process knows only from the
+    parent's positive record (``_bind_and_resume``). A job-refused child can outlive its ancestor, and once the
+    ancestor is gone nothing keeps the checkout busy for it.
+    """
+    join = _checkout_join(Path(request["source"]))
+    if join == "own" or (join == "ancestor" and request.get(_UPDATE_JOB) == _UPDATE_JOB_BOUND):
+        return None
+    return _JOIN_WITHOUT_CUSTODY[join]
+
+
+def _checkout_custody(request: dict) -> str | None:
+    """None when this process holds the update's native checkout lock or (re)acquires it now, with custody of its
+    own, else the refusal.
 
     Port adaptation A7.4 (Hermes 8c2c45fd finding 4). ``_acquire_checkout`` is the native join: a POSIX bootstrap
     joins the descriptor its parent passed (``pass_fds``), a Windows one joins with its own lease while its update
     ancestor lives, and either takes a lock that has since become free. A refusal (another owner holds it, or the
     Windows lease join failed) means this process has no custody to write shared install state under.
+    A7.5 (Hermes cfadb94a): a held or new join counts only when it fences this process's writes
+    (``_join_without_custody``).
     """
     from hermes_cli.update_lock import _acquire_checkout, holds_checkout_lock
 
-    if holds_checkout_lock(root):
-        return None
-    try:
-        refused = _acquire_checkout(root)
-    except OSError as exc:
-        return f"the checkout lock could not be opened ({exc.strerror or type(exc).__name__})"
-    if refused is None:
-        return None
-    return refused.reason or f"held by process {refused.pid}"
+    root = Path(request["source"])
+    if not holds_checkout_lock(root):
+        try:
+            refused = _acquire_checkout(root)
+        except OSError as exc:
+            return f"the checkout lock could not be opened ({exc.strerror or type(exc).__name__})"
+        if refused is not None:
+            return refused.reason or f"held by process {refused.pid}"
+    return _join_without_custody(request)
+
+
+def _join_for_preparation(request: dict) -> None:
+    """Windows (review L3): a bootstrap child the update's job refused runs outside the job and outlives a killed
+    owner, so it joins the checkout lock before anything in ``_prepare_scoped`` writes the checkout (uv's sync
+    children, the generation collector): the join takes a lease byte of its own (R5b, as the --prepared child does
+    in complete_source_checkout). Held until this bootstrap exits, after the --prepared child; the kernel drops it.
+
+    A7.5 (Hermes cfadb94a): a join that does not fence this process (``_join_without_custody``) is dropped and
+    refused before any write, so the outer handler's settle joins afresh (and can take a lock that has since come
+    free) or reports to the parent.
+    """
+    from hermes_cli.update_lock import _acquire_checkout, _release_checkout
+
+    refused = _acquire_checkout(Path(request["source"]))
+    if refused is not None:
+        raise RuntimeError("could not join the update's checkout lock "
+                           f"({refused.reason or f'held by process {refused.pid}'})")
+    missing = _join_without_custody(request)
+    if missing is not None:
+        _release_checkout()
+        raise RuntimeError(f"could not join the update's checkout lock with custody of its own ({missing})")
 
 
 def _report_without_custody(request: dict, result_path: Path, step: str, reason: str, refused: str) -> int:
@@ -339,8 +413,9 @@ def _settle_after_commit(request: dict, result_path: Path, step: str, reason: st
     A7.4 (Hermes 8c2c45fd finding 4): only with the update's checkout custody (held or re-acquired). A Windows
     bootstrap whose lease join was refused (``_prepare_scoped``) or that failed before joining reaches this from
     ``_bootstrap``'s outer handler without it, and then only reports (``_report_without_custody``).
+    A7.5 (Hermes cfadb94a): so does one whose join rests on its ancestor alone outside the update's job.
     """
-    refused = _checkout_custody(Path(request["source"]))
+    refused = _checkout_custody(request)
     if refused is not None:
         return _report_without_custody(request, result_path, step, reason, refused)
     from hermes_cli import update_receipt
@@ -388,17 +463,7 @@ def _prepare_scoped(request: dict, request_path: Path, result_path: Path) -> int
     root = Path(request["source"])
     update_id = request["receipt"]["update_id"]
     if sys.platform == "win32":
-        # Windows (review L3): a bootstrap child the update's job refused runs outside the job
-        # and outlives a killed owner, so it joins the checkout lock before anything below
-        # writes the checkout (uv's sync children, the generation collector): the join takes a
-        # lease byte of its own (R5b, as the --prepared child does in complete_source_checkout).
-        # Held until this bootstrap exits, after the --prepared child; the kernel drops it.
-        from hermes_cli.update_lock import _acquire_checkout
-
-        refused = _acquire_checkout(root)
-        if refused is not None:
-            raise RuntimeError("could not join the update's checkout lock "
-                               f"({refused.reason or f'held by process {refused.pid}'})")
+        _join_for_preparation(request)
     from hermes_cli.venv_sync import arm_completion, collect_superseded_generations
 
     # The foreign-owned-venv refusal runs in the parent BEFORE the swap (update_cmd_commit

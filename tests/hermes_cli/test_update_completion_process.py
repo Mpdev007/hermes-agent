@@ -398,7 +398,7 @@ def test_unwritable_gateway_status_never_fails_a_settled_commit(tmp_path, monkey
 
     monkeypatch.setattr(venv_sync, "arm_completion", lambda root, **kwargs: None)
     # A7.4: this settle holds the update's checkout custody (not under test here; see the custody selectors below).
-    monkeypatch.setattr(update_completion, "_checkout_custody", lambda root: None)
+    monkeypatch.setattr(update_completion, "_checkout_custody", lambda request: None)
     receipt = {"update_id": "u1", "outcome": "success", "finished_at": "now"}
     monkeypatch.setattr(update_completion, "_read_terminal_receipt", lambda request: receipt)
     home = tmp_path / "home-is-a-file"
@@ -497,14 +497,19 @@ def test_a_bootstrap_with_the_checkout_still_settles_natively(tmp_path, monkeypa
     from hermes_cli import update_lock
 
     source, home, request, writes = _custody_case(tmp_path, monkeypatch)
-    if custody == "held":
-        monkeypatch.setattr(update_lock, "holds_checkout_lock", lambda root=None: True)
+    if custody == "held":  # A7.5: a real descriptor this bootstrap locked, recorded as the native join records it
+        import fcntl
+
+        lock_path = update_lock.checkout_lock_path(source)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monkeypatch.setattr(update_lock, "_HELD", {"path": str(lock_path), "fd": fd, "owned": True, "depth": 1})
     receipt = {"update_id": request["receipt"]["update_id"], "outcome": "success", "finished_at": "now"}
     monkeypatch.setattr(update_completion, "_read_terminal_receipt", lambda request: receipt)
     result_path = tmp_path / "result.json"
     try:
         assert update_completion._settle_after_commit(request, result_path, "dependencies", "pip failed") == 0
-        assert (update_lock._HELD is not None) == (custody == "reacquired")
+        assert update_completion._checkout_join(source) == "own"
     finally:
         _close_held_lock()
     assert writes == ["tail marker"]
@@ -541,6 +546,178 @@ def test_the_update_that_holds_the_checkout_settles_a_bootstrap_without_it(trans
     lock = update_lock.UpdateLock()
     assert lock.acquire()
     lock.release()
+
+
+# ── A7.5 (Hermes cfadb94a, Windows boundary): a join through the ancestor alone is custody only inside the job ──
+# The native join record (``update_lock._HELD``) is data: these selectors set the record a Windows join leaves
+# (``_acquire_checkout``: a lease byte of its own, or ``fd=None, lease=None`` when every byte was taken) and never
+# make the interpreter believe it runs on Windows. The live lease sequence itself is native-Windows only.
+
+def _join_state(monkeypatch, source: Path, kind: str) -> int | None:
+    """Record a native join of ``source``'s checkout lock of the given kind (restored afterwards): ``owned`` /
+    ``inherited`` (a descriptor), ``lease`` (a Windows lease byte of its own), ``ancestor`` (the ancestor alone) or
+    ``none``. Returns the stand-in descriptor it opened, which the caller closes."""
+    from hermes_cli import update_lock
+
+    if kind == "none":
+        monkeypatch.setattr(update_lock, "_HELD", None)
+        return None
+    fd = None if kind == "ancestor" else os.open(os.devnull, os.O_RDONLY)
+    held = {"path": str(update_lock.checkout_lock_path(source)), "fd": None, "owned": False, "depth": 1}
+    if kind in ("owned", "inherited"):
+        held.update(fd=fd, owned=kind == "owned")
+    else:
+        held["lease"] = None if fd is None else (fd, update_lock._WINDOWS_LOCK_OFFSET + 1)
+    monkeypatch.setattr(update_lock, "_HELD", held)
+    return fd
+
+
+def _close(*fds) -> None:
+    for fd in fds:
+        if fd is not None:
+            os.close(fd)
+
+
+@pytest.mark.parametrize("kind,update_job,custody", [
+    ("owned", None, True), ("inherited", None, True), ("lease", None, True), ("ancestor", "bound", True),
+    ("ancestor", None, False), ("ancestor", "refused", False), ("ancestor", True, False), ("none", "bound", False),
+])
+def test_a_checkout_join_is_custody_only_with_its_own_descriptor_or_lease_or_inside_the_job(
+        tmp_path, monkeypatch, kind, update_job, custody):
+    """Native ownership decides: a descriptor or lease of its own always fences this process's writes; a join
+    through the ancestor alone only with the parent's exact positive record that its job took this child."""
+    source, _home, request, _writes = _custody_case(tmp_path, monkeypatch)
+    if update_job is not None:
+        request["update_job"] = update_job
+    fd = _join_state(monkeypatch, source, kind)
+    try:
+        assert (update_completion._join_without_custody(request) is None) == custody
+    finally:
+        _close(fd)
+
+
+def test_an_uncontained_ancestor_only_join_settles_nothing_shared_and_answers_its_parent(tmp_path, monkeypatch,
+                                                                                        capsys):
+    """Post-commit settlement: a bootstrap whose join rests on its live ancestor alone, outside the job, writes no
+    tail marker, receipt or gateway status (red on A7.4: ``holds_checkout_lock`` accepted the join and the settle
+    armed the tail). Its correlated private answer names the reason; the parent settles it as before."""
+    source, home, request, writes = _custody_case(tmp_path, monkeypatch)
+    _join_state(monkeypatch, source, "ancestor")
+    result_path = tmp_path / "result.json"
+    code = update_completion._settle_after_commit(request, result_path, "completion",
+                                                  "the completion process exited 1 without a result")
+    assert code == 1 and writes == [] and not (home / ".update_exit_code").exists()
+    answer = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert answer["update_id"] == request["receipt"]["update_id"]
+    assert answer["exit_code"] == 1 and answer["receipt"] is None
+    assert "only through its live update ancestor" in answer["error"] and "completion owed" in answer["error"]
+    assert "could not hold the update's checkout" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("kind,update_job", [("lease", None), ("ancestor", "bound")])
+def test_a_bootstrap_with_its_own_lease_or_inside_the_job_still_settles_natively(tmp_path, monkeypatch, kind,
+                                                                                update_job):
+    """Positive controls: a valid lease of its own, or a join through the ancestor inside the job, still makes the
+    native post-commit settle: it arms the tail and answers with its terminal receipt."""
+    source, home, request, writes = _custody_case(tmp_path, monkeypatch)
+    if update_job is not None:
+        request["update_job"] = update_job
+    fd = _join_state(monkeypatch, source, kind)
+    receipt = {"update_id": request["receipt"]["update_id"], "outcome": "success", "finished_at": "now"}
+    monkeypatch.setattr(update_completion, "_read_terminal_receipt", lambda request: receipt)
+    result_path = tmp_path / "result.json"
+    try:
+        assert update_completion._settle_after_commit(request, result_path, "dependencies", "pip failed") == 0
+    finally:
+        _close(fd)
+    assert writes == ["tail marker"]
+    assert json.loads(result_path.read_text(encoding="utf-8-sig"))["receipt"] == receipt
+    assert (home / ".update_exit_code").read_text(encoding="utf-8").strip() == "0"
+
+
+@pytest.mark.parametrize("outcome", ["refused", "ancestor", "ancestor-in-job", "lease"])
+def test_the_preparation_join_needs_custody_of_its_own(tmp_path, monkeypatch, outcome):
+    """Initial preparation (the Windows join in ``_prepare_scoped``, driven through its helper): an explicit refusal
+    and a join through the ancestor alone outside the job raise before anything writes the checkout, and the latter
+    join is dropped so the settle joins afresh; a lease of its own, or the ancestor inside the job, proceeds."""
+    from hermes_cli import update_lock
+
+    source, _home, request, _writes = _custody_case(tmp_path, monkeypatch)
+    if outcome == "ancestor-in-job":
+        request["update_job"] = "bound"
+    fds: list[int | None] = []
+
+    def native_join(root):
+        if outcome == "refused":
+            return update_lock.UpdateHolder(pid=4242, age_seconds=0.0)
+        fds.append(_join_state(monkeypatch, source, "lease" if outcome == "lease" else "ancestor"))
+        return None
+    monkeypatch.setattr(update_lock, "_acquire_checkout", native_join)
+    try:
+        if outcome in ("refused", "ancestor"):
+            with pytest.raises(RuntimeError, match="held by process 4242" if outcome == "refused"
+                               else "custody of its own"):
+                update_completion._join_for_preparation(request)
+            assert update_lock._HELD is None
+        else:
+            update_completion._join_for_preparation(request)
+            assert update_completion._checkout_join(source) == ("own" if outcome == "lease" else "ancestor")
+    finally:
+        _close(*fds)
+
+
+def test_an_uncontained_ancestor_only_bootstrap_prepares_nothing_and_answers_its_parent(tmp_path, monkeypatch):
+    """The whole bootstrap route: preparation refuses the join through the ancestor alone before any write, the
+    outer handler's settle joins afresh, meets the same join and only reports to the parent."""
+    from hermes_cli import update_lock
+
+    source, home, request, writes = _custody_case(tmp_path, monkeypatch)
+    joins: list[str] = []
+
+    def native_join(root):
+        joins.append("ancestor")
+        _join_state(monkeypatch, source, "ancestor")
+        return None
+    monkeypatch.setattr(update_lock, "_acquire_checkout", native_join)
+
+    def prepare(request, request_path, result_path):
+        update_completion._join_for_preparation(request)  # the Windows branch of _prepare_scoped
+        writes.append("dependency preparation")
+        return 0
+    monkeypatch.setattr(update_completion, "_prepare", prepare)
+    result_path = tmp_path / "result.json"
+    assert update_completion._bootstrap(request, tmp_path / "request.json", result_path) == 1
+    assert joins == ["ancestor", "ancestor"] and writes == [] and not (home / ".update_exit_code").exists()
+    answer = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert answer["exit_code"] == 1 and answer["receipt"] is None
+    assert "dependencies owed" in answer["error"] and "only through its live update ancestor" in answer["error"]
+
+
+@pytest.mark.parametrize("binder,bound,recorded", [
+    ("owned", True, True), ("lease", True, True), ("ancestor", True, False), ("owned", False, False),
+])
+def test_the_parent_records_the_job_binding_only_after_binding_with_custody_of_its_own(
+        tmp_path, monkeypatch, binder, bound, recorded):
+    """The parent's half (``_bind_and_resume``): the positive record reaches the child's request before the child is
+    resumed, only when the job took the child and the parent's own join fences anything; a refused bind or a
+    binder joined through its own ancestor records none. The parent's copy of the request is not changed."""
+    from hermes_cli import update_lock
+
+    source, _home, request, _writes = _custody_case(tmp_path, monkeypatch)
+    request_path = tmp_path / "request.json"
+    update_completion._write_json(request_path, request)
+    fd = _join_state(monkeypatch, source, binder)
+    resumed: list[dict] = []
+    monkeypatch.setattr(update_lock, "bind_child_to_update_tree",
+                        lambda proc: None if bound else OSError(5, "Access is denied"))
+    monkeypatch.setattr(update_lock, "resume_suspended_child",
+                        lambda proc: resumed.append(json.loads(request_path.read_text(encoding="utf-8-sig"))))
+    try:
+        update_completion._bind_and_resume(object(), request, request_path)
+    finally:
+        _close(fd)
+    assert len(resumed) == 1 and (resumed[0].get("update_job") == "bound") == recorded
+    assert "update_job" not in request
 
 
 @pytest.mark.parametrize("cleanup_failure", [None, "kill", "wait"])
