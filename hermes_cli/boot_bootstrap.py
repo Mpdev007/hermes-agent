@@ -256,7 +256,21 @@ def _owed_steps(known: dict) -> list[str]:
     step whose result says ``owed`` (default plugins a failed fetch left uninstalled)."""
     results = known.get("results") or {}
     owed = [name for name, result in results.items() if isinstance(result, dict) and result.get("owed")]
+    if "install_default_plugins" not in owed and _deferred_default_plugins_owed():
+        owed.append("install_default_plugins")
     return owed + (["migrate_config"] if owed_config_migration(known) is not None else [])
+
+
+def _deferred_default_plugins_owed() -> bool:
+    """Port adaptation A5: an install-level request a deferred automatic default-plugin install left
+    (``default_plugins.deferred_request_owed``) reopens the step on every profile's boot, even on a revision
+    whose record had settled. Unreadable: not owed here (the work only waits longer)."""
+    try:
+        from hermes_cli.default_plugins import deferred_request_owed
+        return deferred_request_owed()
+    except Exception:  # health: allow BLE001 -- boot never fails on this probe
+        logger.debug("deferred default-plugin request unreadable", exc_info=True)
+        return False
 
 
 def _retry_owed_migration(record: Path, identity: str, known: dict):

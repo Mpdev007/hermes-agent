@@ -14,6 +14,10 @@ maintenance tail, in the foreground, for every profile home). Installs that neve
 boot bootstrap starts it once per installed revision and on later starts until a child reports every
 default settled. Nothing is fetched where ``security.allow_lazy_installs`` is off, and a failed
 attempt backs the next one off (an hour, doubling to a week).
+
+Port adaptation A5: under default-only maintenance (explicit, pending or carried) none of this automatic
+every-home work starts: a create, boot, child or pass leaves one install-level request
+(``cache/default-plugins.owed``) that reopens the boot step for a later ordinary start, whose clean pass clears it.
 """
 
 from __future__ import annotations
@@ -197,6 +201,9 @@ def install_defaults_all_homes(*, say: Callable[[str], None] = print, wait: floa
     to finish (``TimeoutError`` past that)."""
     from hermes_cli.plugin_catalog import fetch_live_catalog
     from pm.plugins_state import dependency_homes
+    if installs_deferred():
+        # Port adaptation A5: under default-only maintenance no home is read, nothing is fetched or written.
+        return {"installed": [], "owed": [], "deferred": True}
     summary: dict = {"installed": [], "owed": []}
     policies = {home: fetch_policy(home) for home in dependency_homes()}
     summary["owed"] += [str(home) for home, policy in policies.items() if policy == "unreadable"]
@@ -210,6 +217,9 @@ def install_defaults_all_homes(*, say: Callable[[str], None] = print, wait: floa
         return summary
     with _machine_lock(wait):  # never two installers in one home (an update tail beside a detached child)
         for home in homes:
+            if installs_deferred():  # A5: an obligation that began during the pass stops it before this home's writes
+                summary["deferred"] = True
+                break
             try:
                 outcome = install_defaults(home, say=say, entries=entries)
             except Exception:  # health: allow BLE001 -- one home (unreadable config.yaml) never stops the rest; retried next run
@@ -241,6 +251,42 @@ def _identity() -> str:
     return current_install_identity(install_root()) or ""
 
 
+# ── port adaptation A5: automatic every-home work waits under default-only maintenance ─────────────
+
+def installs_deferred() -> bool:
+    """Whether automatic every-home work waits in this context (explicit, pending or carried default scope:
+    ``maintenance_scope.every_home_installs_deferred``). Checked at the start (:func:`spawn_install`), the child
+    (:func:`_run_child`) and the installer (:func:`install_defaults_all_homes`) before any fetch, spawn or
+    per-profile write."""
+    from hermes_cli.maintenance_scope import every_home_installs_deferred
+    from pm.paths import install_root
+    return every_home_installs_deferred(install_root())
+
+
+def _owe_deferred(root: Path) -> None:
+    """Leave the one install-level request a deferral owes (``default-plugins.owed``, beside ``settled``)."""
+    owed = _state(root, "owed")
+    owed.parent.mkdir(parents=True, exist_ok=True)
+    owed.touch()
+
+
+def deferred_request_owed() -> bool:
+    """Whether a deferred request is owed: every profile's boot then owes the default-plugin step, even on a
+    revision whose record had settled (``boot_bootstrap._owed_steps``)."""
+    from pm.environments import dependency_home_root
+    return _state(Path(dependency_home_root()), "owed").exists()
+
+
+def _consume_owed(root: Path, started: float) -> None:
+    """A clean ordinary pass answers a deferred request made before it began; one made during it stays owed."""
+    owed = _state(root, "owed")
+    try:
+        if owed.stat().st_mtime < started:
+            owed.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def spawn_install(home: Optional[Path] = None) -> bool:
     """Start the detached child that installs the defaults for every home (*home*, when given, must allow
     fetching), unless the last attempt failed recently. A running child sees the request when it finishes
@@ -252,6 +298,12 @@ def spawn_install(home: Optional[Path] = None) -> bool:
     from pm.environments import dependency_home_root
     from pm.paths import install_root
     root = Path(dependency_home_root())
+    if installs_deferred():
+        # Port adaptation A5: a create (or a boot) under default-only maintenance starts nothing. *home* is not
+        # read, ``settled`` and ``rerun`` are untouched, and one install-level request is owed for a later
+        # ordinary start (:func:`deferred_request_owed`).
+        _owe_deferred(root)
+        return False
     if home is not None and fetch_policy(home) == "denied":
         return False
     _state(root, "settled").unlink(missing_ok=True)  # unsettled until a pass installs it, so every boot re-checks
@@ -281,6 +333,10 @@ def _run_child() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s default-plugins %(message)s",
                         filename=str(root / "logs" / "default-plugins.log"))
     try:
+        if installs_deferred():
+            # Port adaptation A5: the child re-reads pending or carried scope itself and never scans under it.
+            _owe_deferred(root)
+            return 0
         return 1 if install_and_record(say=logger.info, wait=1.0)["owed"] else 0
     except TimeoutError:
         return 0
@@ -303,8 +359,12 @@ def install_and_record(*, say: Callable[[str], None] = print, wait: float = 900.
     while True:
         started = time.time()
         outcome = install_defaults_all_homes(say=say, wait=wait)
-        if not (rerun.exists() and rerun.stat().st_mtime >= started):
+        if outcome.get("deferred") or not (rerun.exists() and rerun.stat().st_mtime >= started):
             break
+    if outcome.get("deferred"):
+        # Port adaptation A5: deferred, not failed: no backoff and nothing settled; the request stays owed.
+        _owe_deferred(root)
+        return outcome
     if outcome["owed"]:
         _note_failure(root, _BACKOFF)
         # A later pass (a profile created after this revision settled) can fail too: owed again.
@@ -313,6 +373,7 @@ def install_and_record(*, say: Callable[[str], None] = print, wait: float = 900.
     _note_success(root, _BACKOFF)
     _state(root, "settled").parent.mkdir(parents=True, exist_ok=True)
     _state(root, "settled").write_text(_identity(), encoding="utf-8")
+    _consume_owed(root, started)
     return outcome
 
 
@@ -322,16 +383,19 @@ def step_install_default_plugins() -> dict:
     from pm.environments import dependency_home_root
     from pm.plugins_state import dependency_homes
     try:
-        from hermes_cli.maintenance_scope import current_scope
-        if current_scope().mode == "default":
-            # Port adaptation A3: default-only maintenance (an explicit scope or a pending default-only
-            # obligation, bound by maybe_run_boot_bootstrap) never reads named homes nor spawns the
-            # every-home installer. The step stays owed, so the next ordinary start runs it unchanged.
+        if installs_deferred():
+            # Port adaptation A3 (A5: the same shared check): default-only maintenance (explicit, pending or
+            # carried) never reads named homes nor spawns the every-home installer. The step stays owed and a
+            # deferred request is left as it is, so the next ordinary start runs the step unchanged.
             return {"ok": True, "skipped": "default-only maintenance", "owed": True}
+        root = Path(dependency_home_root())
         if all(fetch_policy(home) == "denied" for home in dependency_homes()):
+            # A5: nothing may install in any home, so a deferred request is answered as an ordinary create's.
+            _state(root, "owed").unlink(missing_ok=True)
             return {"ok": True, "skipped": "lazy-installs-disabled"}
-        settled = _state(Path(dependency_home_root()), "settled")
-        if settled.is_file() and settled.read_text(encoding="utf-8-sig").strip() == _identity():
+        settled = _state(root, "settled")
+        if (settled.is_file() and settled.read_text(encoding="utf-8-sig").strip() == _identity()
+                and not _state(root, "owed").exists()):  # A5: a deferred request reopens a settled revision
             return {"ok": True}
         return {"ok": True, "spawned": spawn_install(), "owed": True}
     except (OSError, ValueError) as exc:  # unreadable profiles dir, failed spawn: still owed, retried next boot

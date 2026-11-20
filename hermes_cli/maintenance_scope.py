@@ -257,6 +257,42 @@ def resolve_launch_scope(root: Path, argv: list[str]) -> MaintenanceScope:
     return scope
 
 
+# Port adaptation A5: a caller's request (the local owning gateway's ``profiles.create`` carrier) that this
+# context's automatic every-home default-plugin work wait. It only narrows that installer work: it is never a
+# maintenance scope and grants or changes no permission.
+_installs_deferred: ContextVar[bool] = ContextVar('every_home_installs_deferred', default=False)
+
+
+@contextmanager
+def deferring_every_home_installs(carried: bool = True):
+    """Defer automatic every-home default-plugin work inside the block when *carried*; never undoes an
+    enclosing deferral."""
+    token = _installs_deferred.set(_installs_deferred.get() or bool(carried))
+    try:
+        yield
+    finally:
+        _installs_deferred.reset(token)
+
+
+def every_home_installs_deferred(root: Path) -> bool:
+    """Port adaptation A5: whether automatic every-home default-plugin work must wait in this context.
+
+    It waits under an explicit (bound) default scope, this invocation's admitted or relaunch-carried default
+    (:func:`_invocation_floor`), a pending default-only obligation of *root*, or a carried deferral
+    (:func:`deferring_every_home_installs`). Unprovable authority (a malformed marker or handoff) waits too:
+    the answer only narrows installer work and is never used as a permission.
+    """
+    if _installs_deferred.get():
+        return True
+    try:
+        if current_scope().mode == 'default' or _invocation_floor(root) is not None:
+            return True
+        pending = pending_scope(root)
+    except (ScopeSafetyRefusal, OSError):
+        return True
+    return pending is not None and pending.mode == 'default'
+
+
 def require_scope_target(source: bytes | None) -> None:
     """Refuse an older target that would discard scope at the interpreter seam.
 

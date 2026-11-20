@@ -44,7 +44,7 @@ class GatewayCreateError(RuntimeError):
     """The named gateway cannot take the create, or took it and its outcome is unknown."""
 
 
-def _wire(request: ProfileCreateRequest, profile: Optional[str]) -> dict[str, Any]:
+def _wire(request: ProfileCreateRequest, profile: Optional[str], *, defer_default_plugins: bool = False) -> dict[str, Any]:
     # ``no_alias`` always: the wrapper belongs to the terminal's machine, PATH and ``hermes``
     # (written here when the profile landed in this machine's profiles directory). ``profile``: a URL's
     # connection carries no profile-bound ticket, so the terminal's profile is named (Desktop's routing).
@@ -53,6 +53,12 @@ def _wire(request: ProfileCreateRequest, profile: Optional[str]) -> dict[str, An
             "clone_channels": request.clone_channels, "no_skills": request.no_skills,
             "no_alias": True, "sync_imports": request.sync_imports,
             "mirror_credentials": request.mirror_credentials, "share_auth": request.share_auth, "report": True}
+    if defer_default_plugins:
+        # Port adaptation A5: this invocation's default-only maintenance (explicit, pending or carried) crosses
+        # the owning gateway. It only defers that gateway's automatic every-home installer for this create. A
+        # gateway that predates the key refuses it (4000) before creating: the create then runs here, under
+        # this process's own check, or (a URL's gateway) fails; the restriction is never dropped.
+        wire["defer_default_plugins"] = True
     return {**wire, "profile": profile} if profile else wire
 
 
@@ -140,6 +146,8 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
     if not remote and endpoint is None:
         return None
     from hermes_cli.gateway_client import GatewayRPCError, NOT_SENT, connect_gateway
+    from hermes_cli.default_plugins import installs_deferred
+    defer = installs_deferred()  # A5: read here, in the invocation that holds the scope
     machine = " on the gateway's machine" if remote else ""
     unknown = f"{where} may have created '{request.name}'; check `hermes profile list`{machine} before retrying"
     local = _local_profile_dir(request.name)
@@ -157,7 +165,8 @@ def create_through_gateway(request: ProfileCreateRequest) -> Optional[ProfileCre
             attached = True
             if owner_here is not None:
                 ours = await _described_instance(client) == owner_here
-            return await client.rpc("profiles.create", _timeout=CREATE_RPC_TIMEOUT, **_wire(request, profile))
+            return await client.rpc("profiles.create", _timeout=CREATE_RPC_TIMEOUT,
+                                    **_wire(request, profile, defer_default_plugins=defer))
 
     try:
         answer = asyncio.run(_run())

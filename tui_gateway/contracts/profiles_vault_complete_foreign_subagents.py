@@ -209,6 +209,9 @@ class ProfilesCreateParams(ProfileParams):
     clone_config: bool | str | None = None
     sync_imports: bool | str | None = None
     report: bool | str | None = None
+    # Sent by ``hermes profile create`` only under default-only maintenance (explicit, pending or carried): this
+    # create's automatic every-home default-plugin install waits for a later ordinary start. Only narrows.
+    defer_default_plugins: bool | None = None
 
 
 class ProfileMirrored(Result):

@@ -301,7 +301,8 @@ def _(rid, params: dict) -> dict:
     ``model`` + ``provider``, ``no_alias``, ``share_auth`` / ``mirror_credentials`` (both default true, the
     bot page's defaults: a bare ``create_profile()`` seeds a comment-only .env = NO provider headless).
     ``hermes profile create`` also sends ``clone_config`` (``--clone``: copy the caller's profile),
-    ``sync_imports`` and ``report`` (add the receipt it prints, read here).
+    ``sync_imports`` and ``report`` (add the receipt it prints, read here), and under default-only maintenance
+    ``defer_default_plugins`` (this create's automatic every-home default-plugin install waits).
 
     On ``/api/ws`` it runs in the connection's profile (``ws_legacy_fallback.dispatch_legacy`` binds the
     ticket's), so ``--clone`` and the copied keys/model come from the profile the terminal is on. A
@@ -329,8 +330,14 @@ def _(rid, params: dict) -> dict:
         mirror_credentials=is_truthy_value(params.get("mirror_credentials"), True),
         share_auth=is_truthy_value(params.get("share_auth"), True),
         model=model, provider=provider)
+    # Port adaptation A5: a caller's default-only maintenance (``defer_default_plugins``, sent by the local
+    # ``hermes profile create``) defers only this create's automatic every-home installer; any value but an
+    # absent or false one defers (it can only narrow), and it grants nothing. This process's own check applies too.
+    carried = params.get("defer_default_plugins")
     try:
-        result = provision_profile(request)
+        from hermes_cli.maintenance_scope import deferring_every_home_installs
+        with deferring_every_home_installs(carried is not None and carried is not False):
+            result = provision_profile(request)
         receipt = ProfileCreateReceipt.of(request, result) if is_truthy_value(params.get("report", False)) else None
     except (Exception, ConfigBackendUnavailable) as e:  # health: allow BLE001 -- the request's one reply (a config outage is a SystemExit)
         # The full text (redacted) for Desktop's dialog; ``data`` carries it in the parts a client keeps.
