@@ -2154,6 +2154,16 @@ from hermes_cli.update_receipt import update_receipt_scope
 
 @update_receipt_scope()
 def cmd_update(args):
+    from hermes_cli.maintenance_scope import resolve_scope, maintenance_scope
+    scope = resolve_scope(PROJECT_ROOT, getattr(args, "maintenance_scope", None))
+    if scope.mode == "default" and (getattr(args, "gateway", False)
+                                    or not getattr(args, "no_gateway_restart", False)):
+        raise ValueError("default-only maintenance must run from a shell with --no-gateway-restart")
+    with maintenance_scope(scope):
+        return _cmd_update_scoped(args)
+
+
+def _cmd_update_scoped(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
     # Marks this frame as the CURRENT updater for
     # _old_updater.in_historical_update(); historical on-disk updaters do not
@@ -2194,6 +2204,8 @@ def cmd_update(args):
         return custody.refusal_notice() if custody is not None else None
 
     try:
+        from hermes_cli.maintenance_scope import resolve_scope, current_scope
+        resolve_scope(PROJECT_ROOT, current_scope())  # revalidate after acquiring checkout custody
         _cmd_update_impl(args, gateway_mode=gateway_mode)
     except (InstallError, OSError, subprocess.SubprocessError) as exc:
         refusal = _custody_refusal()

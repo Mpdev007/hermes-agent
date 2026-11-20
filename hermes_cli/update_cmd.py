@@ -212,7 +212,7 @@ _UPDATE_CRITICAL_FILES = (
     "hermes_cli/update_handoff.py", "hermes_cli/venv_sync.py", "pm/__init__.py", "pm/environments.py",
     "hermes_cli/main.py", "hermes_cli/config.py", "hermes_cli/__init__.py",
     "hermes_cli/web_server.py", "cli.py", "run_agent.py", "model_tools.py", "toolsets.py",
-    "hermes_constants.py")
+    "hermes_constants.py", "hermes_cli/maintenance_scope.py")
 
 
 def _record_update_step(step: str, ok: bool, detail: str = "") -> None:
@@ -695,7 +695,9 @@ def _source_completion_request(opts, plan, snapshot_id, windows_resume, desktop,
     if current is None:
         _completion_receipt.begin_update_receipt()
         current = _completion_receipt._current.get()
+    from hermes_cli.maintenance_scope import current_scope
     return {
+        "maintenance_scope": current_scope().to_dict(),
         "schema": 1, "source": str(_m().PROJECT_ROOT.resolve()),
         "home": str(get_hermes_home()), "branch": "main", "desktop": desktop,
         "assume_yes": opts.assume_yes, "gateway_mode": gateway_mode,
@@ -1524,6 +1526,8 @@ def _begin_update_receipt_and_plan(args):
         # See #74973, #81193, #85753, #88848, #91277.
         from hermes_cli.update_receipt import begin_update_receipt
         begin_update_receipt()
+        from hermes_cli.maintenance_scope import record_scope
+        record_scope()
         _record_update_initiator()
 
     # Plan phase: snapshot runtimes/supervisors/version (read-only; probe failure records

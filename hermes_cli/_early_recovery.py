@@ -1434,7 +1434,10 @@ def recover_if_needed(project_root: Path | None = None, argv: list[str] | None =
         return True
     except Exception as exc:
         from pm.environments import install_state_permission_message
+        from hermes_cli.maintenance_scope import ScopeSafetyRefusal
 
+        if isinstance(exc, ScopeSafetyRefusal):
+            raise  # Scope refusals are never retryable dependency failures.
         if isinstance(exc, PermissionError) and install_state_permission_message(root, exc):
             raise  # The bootstrap or PM CLI reports the access error once.
         for marker in markers:

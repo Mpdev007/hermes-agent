@@ -1099,6 +1099,9 @@ def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = Fals
         try:
             _record_migration(home, feature)
         except Exception as exc:
+            from hermes_cli.maintenance_scope import current_scope
+            if current_scope().mode == "default":
+                raise
             say(f"  ⚠ {feature.label} moved out of core into the '{feature.plugin}' plugin: its per-platform "
                 f"toolset selection could not be kept ({exc}). Check `hermes tools`"
                 + ("." if present else f" and run `{_install_command(feature.plugin, home)}`."))
@@ -1110,6 +1113,9 @@ def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = Fals
                         feature.label, home)
             continue
         if catalog_source(feature.plugin) is None:
+            from hermes_cli.maintenance_scope import current_scope
+            if current_scope().mode == "default":
+                raise RuntimeError(f"required plugin {feature.plugin!r} is absent from the catalog")
             _note_failure(home, feature.plugin)
             say(_noticed(f"  ⚠ {feature.label} moved out of core into the '{feature.plugin}' plugin, which this "
                          f"Hermes cannot find in the plugin catalog yet. Run "
@@ -1175,6 +1181,9 @@ def _install_one(home: Path, feature: LeftCoreFeature, *, install: Callable[[str
         try:
             _record_migration(home, feature)
         except Exception as exc:  # the next run sees the plugin dir and records it then
+            from hermes_cli.maintenance_scope import current_scope
+            if current_scope().mode == "default":
+                raise
             logger.debug("left-core install marker not written for %s: %s", home, exc)
         say(_noticed(f"  ✓ {feature.label} moved out of core — installed the '{feature.plugin}' plugin from the "
                      f"catalog ({feature.unchanged}).", home, feature, process_env))
@@ -1211,11 +1220,14 @@ def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
         return hermes_home_key(home) == hermes_home_key(get_routing_process_hermes_home())
 
     pending: dict[tuple[str, bool], tuple[LeftCoreFeature, list[Path]]] = {}
-    for home in dependency_homes():
+    from hermes_cli.maintenance_scope import current_scope
+    for home in current_scope().homes(dependency_homes()):
         try:
             features = _pending(home, say=labelled(home), process_env=launched(home))
             consent = bool(features) and _home_consent(home)
         except Exception as exc:
+            if current_scope().mode == "default":
+                raise
             logger.debug("left-core migration skipped for %s: %s", home, exc)
             continue
         for feature in features:
@@ -1234,6 +1246,8 @@ def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
                                     process_env=launched(home)):
                         installed.append(feature.plugin)
                         continue
+                    if current_scope().mode == "default":
+                        raise RuntimeError("default profile plugin migration remains incomplete")
                     rest = homes[index + 1:]
                     if rest:
                         say(f"  ⚠ The '{feature.plugin}' plugin was not installed for "
@@ -1241,6 +1255,8 @@ def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
                             + ", ".join(f"`{_install_command(feature.plugin, h)}`" for h in rest) + ".")
                     break
     except KeyboardInterrupt:
+        if current_scope().mode == "default":
+            raise
         say("  ⚠ Plugin migration cancelled. Profiles already migrated keep their plugin; run "
             "`hermes plugins install <name>` (with `-p <profile>`) for the rest.")
     return installed

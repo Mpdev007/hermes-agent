@@ -89,14 +89,79 @@ def _recover_plugin_publication(project: Path, row: dict, journal: Path) -> None
     journal.unlink()
 
 
+def require_publication_scope(project: Path, row: dict) -> None:
+    """Validate the entire native journal before ANY mutation, under install lock.
+
+    The restriction is not authority from a journal label: only canonical default
+    targets and the existing native journal/facts contract can be recovered.
+    All/unscoped recovery retains its legacy behavior.
+    """
+    from hermes_cli.maintenance_scope import publication_scope, ScopeSafetyRefusal
+    scope = publication_scope(project)
+    if scope.mode == 'all':
+        return
+    home = Path(scope.home)
+
+    def digest(value):
+        return value is None or (isinstance(value, str) and len(value) == 64
+                                 and all(c in '0123456789abcdef' for c in value))
+
+    def blob(value):
+        if value is not None:
+            if not isinstance(value, str):
+                raise ValueError('invalid publication bytes')
+            base64.b64decode(value, validate=True)
+
+    try:
+        if (not isinstance(row, dict) or 'facts_before' not in row
+                or not digest(row['facts_before']) or type(row.get('committed', False)) is not bool):
+            raise ValueError('unknown publication facts or commit record')
+        if row.get('kind') == 'plugin':
+            if set(row) - {'kind', 'target', 'backup', 'metadata', 'target_existed',
+                           'facts_before', 'metadata_before', 'metadata_after', 'committed'}:
+                raise ValueError('unknown plugin publication fields')
+            target, backup, metadata = (Path(row[key]) for key in ('target', 'backup', 'metadata'))
+            plugins = home / 'plugins'
+            if (target.parent != plugins or target.resolve().parent != plugins
+                    or target.name.startswith('.') or backup.parent != plugins
+                    or backup.resolve().parent != plugins or not backup.name.startswith('.previous-')
+                    or metadata != plugins / '.install-metadata.json' or metadata.resolve() != metadata
+                    or type(row['target_existed']) is not bool or row['metadata_after'] is None):
+                raise ValueError('plugin publication is not exclusively default-owned')
+            blob(row['metadata_before'])
+            blob(row['metadata_after'])
+        else:
+            allowed = {'configs', 'facts_before', 'committed'} if 'configs' in row else {
+                'config', 'previous', 'config_after', 'facts_before', 'committed'}
+            if set(row) - allowed:
+                raise ValueError('unknown publication kind or fields')
+            entries = row['configs'] if 'configs' in row else [row]
+            if not isinstance(entries, list) or not entries:
+                raise ValueError('invalid publication configs')
+            for entry in entries:
+                if not isinstance(entry, dict) or set(entry) - (allowed if entry is row else {'config', 'previous', 'config_after'}):
+                    raise ValueError('invalid publication config record')
+                config = Path(entry['config'])
+                if config != home / 'config.yaml' or config.resolve() != config:
+                    raise ValueError('config publication is not exclusively default-owned')
+                blob(entry['previous'])
+                if not isinstance(entry['config_after'], str) or not digest(entry['config_after']):
+                    raise ValueError('invalid publication config digest')
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        raise ScopeSafetyRefusal(f'default-only dependency publication refused: {exc}') from exc
+
+
 def recover_publication(project: Path) -> None:
     """Recover while holding runtime_lock, before activation or another write."""
+    from hermes_cli.maintenance_scope import publication_scope, ScopeSafetyRefusal
+    scope = publication_scope(project)
     journal = install_state_dir(project) / "publication.json"
     data = _bytes(journal)
     if data is None:
         return
     try:
         row = json.loads(data)
+        require_publication_scope(project, row)
         if row.get("kind") == "plugin":
             _recover_plugin_publication(project, row, journal)
             return
@@ -121,7 +186,11 @@ def recover_publication(project: Path) -> None:
                 else:
                     _atomic_bytes(config, previous)
         journal.unlink()
+    except ScopeSafetyRefusal:
+        raise
     except (ValueError, KeyError, TypeError, OSError) as exc:
+        if scope.mode == 'default':
+            raise ScopeSafetyRefusal(f'cannot safely recover dependency publication: {journal}: {exc}') from exc
         raise RuntimeError(f"cannot recover dependency publication: {journal}: {exc}") from exc
 
 
@@ -129,6 +198,7 @@ def finish_publication(project: Path) -> None:
     """Persist a commit even when code/config changed without a new generation."""
     journal = install_state_dir(project) / "publication.json"
     row = json.loads(journal.read_bytes())
+    require_publication_scope(project, row)
     row["committed"] = True
     _atomic_bytes(journal, json.dumps(row).encode())
     recover_publication(project)

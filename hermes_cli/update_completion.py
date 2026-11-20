@@ -267,7 +267,7 @@ def settle_lost_completion(request: dict, reason: str) -> dict:
         try:
             from hermes_cli.venv_sync import arm_completion
 
-            arm_completion(Path(request["source"]))
+            arm_completion(Path(request["source"]), maintenance_scope=request.get("maintenance_scope"))
         except Exception as exc:  # health: allow BLE001 -- post-commit boundary: stale dependencies still make the next launch sync
             print(f"  ⚠ Could not record the owed source-update tail: {exc}")
         _report_desktop_build_owed(request, _running_record(request), "the update completion did not finish")
@@ -297,7 +297,7 @@ def _settle_after_commit(request: dict, result_path: Path, step: str, reason: st
     from hermes_cli.venv_sync import arm_completion
 
     try:
-        arm_completion(Path(request["source"]))
+        arm_completion(Path(request["source"]), maintenance_scope=request.get("maintenance_scope"))
     except OSError as exc:  # the next launch still sees stale dependencies and syncs them
         print(f"  ⚠ Could not record the owed source-update tail: {exc}")
     receipt = _read_terminal_receipt(request)  # a prepared child that finalized, then died
@@ -320,12 +320,21 @@ def _settle_after_commit(request: dict, result_path: Path, step: str, reason: st
 
 
 def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
+    from hermes_cli.maintenance_scope import resolve_scope, maintenance_scope
+    scope = resolve_scope(Path(request["source"]), request.get("maintenance_scope"))
+    with maintenance_scope(scope):
+        return _prepare_scoped(request, request_path, result_path)
+
+
+def _prepare_scoped(request: dict, request_path: Path, result_path: Path) -> int:
     import pm
     from pm import receipt
     from pm.client import ensure_tools_for_sync
     from pm.environments import activation_environment, project_python
     from pm.extras import first_generation_selection
 
+    from hermes_cli.maintenance_scope import current_scope
+    scope = current_scope()
     root = Path(request["source"])
     update_id = request["receipt"]["update_id"]
     if sys.platform == "win32":
@@ -352,10 +361,10 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
             # This file runs from the new tree, so its lockfile carries the new
             # pins; tools (incl. bumped uv/python) land before the sync uses them.
             ensure_tools_for_sync()
-            # An update never fails because of a plugin: misfits are disabled and reported. A
-            # pre-PM tree that reached this code with no recorded selection carries its old venv.
+            # Preserve the native pre-PM selection and the complete dependency union.
+            # Scoped maintenance cannot disable another profile's incompatible plugin.
             pm.sync_venv(first_generation_selection(root), explicit=True, project_root=root,
-                         evict_incompatible_plugins=True)
+                         evict_incompatible_plugins=scope.mode == "all")
             collect_superseded_generations(root)
         finally:
             request["pm_receipt"] = receipt.last_for_update(update_id)
@@ -380,6 +389,15 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
 
 
 def _complete_selected(request: dict) -> bool:
+    from hermes_cli.maintenance_scope import resolve_scope, maintenance_scope
+    scope = resolve_scope(Path(request["source"]), request.get("maintenance_scope"))
+    if scope.mode == "default" and (request.get("gateway_mode") or not request.get("no_gateway_restart")):
+        raise ValueError("default-only maintenance cannot perform a fleet restart")
+    with maintenance_scope(scope):
+        return _complete_selected_scoped(request)
+
+
+def _complete_selected_scoped(request: dict) -> bool:
     """Everything after the commit point. No step failure fails the update (contract C3).
 
     Each step is independent; a failed one prints ``⚠``, lands on the receipt as a follow-up
@@ -423,6 +441,7 @@ def _complete_selected(request: dict) -> bool:
             root, desktop=request["desktop"], assume_yes=request["assume_yes"],
             gateway_mode=request["gateway_mode"], pre_update_snapshot_id=request["snapshot_id"],
             pre_update_version=request["pre_update_version"],
+            maintenance_scope=request.get("maintenance_scope"),
             completion_message=request.get("completion_message"),
             announce=None if request.get("completion_message") else "\n✓ Code updated!",
             followups=followups, after_dependencies=prepare_gateways)
@@ -580,6 +599,8 @@ def main() -> int:
 
     install()
     sys.stdout = _ForwardedOutput(sys.stdout, request.get("stdout_isatty", False))
+    from hermes_cli.maintenance_scope import resolve_scope
+    resolve_scope(root, request.get("maintenance_scope"))
     if "--prepared" in sys.argv[3:]:
         # Claim the selected generation's lease and process its .pth files only
         # after PM selection, before importing any application dependencies.

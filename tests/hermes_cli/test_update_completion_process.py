@@ -89,9 +89,11 @@ def transition(tmp_path):
         "refuse_foreign_owned_venv = lambda root: None\n"
         "from pathlib import Path\n"
         "import os\n"
-        "def arm_completion(root):\n"
+        "def completion_pending_path(root):\n"
+        "    return Path(os.environ['HERMES_HOME']) / 'completion-pending'\n"
+        "def arm_completion(root, **kwargs):\n"
         "    path = Path(os.environ['HERMES_HOME']) / 'completion-pending'\n"
-        "    path.write_text('owed')\n"
+        "    path.write_text('source update tail not finished\\n')\n"
         "    return path\n"
         "def clear_completion(root):\n"
         "    (Path(os.environ['HERMES_HOME']) / 'completion-pending').unlink()\n"
@@ -114,6 +116,8 @@ def transition(tmp_path):
     # modules its imports reach: update_lock (the tail claims the shared update lock) and
     # _subprocess_compat (it exposes PM's git for the builds) — neither exists in the OLD
     # tree, and a bare copy of source_completion.py would die on ModuleNotFoundError.
+    shutil.copy2(Path(update_completion.__file__).with_name("maintenance_scope.py"),
+                 package / "maintenance_scope.py")
     shutil.copy2(Path(update_completion.__file__).with_name("source_completion.py"),
                  package / "source_completion.py")
     shutil.copy2(Path(update_completion.__file__).with_name("update_lock.py"),
@@ -169,6 +173,8 @@ def transition(tmp_path):
         "def record_stage(*args, **kwargs): pass\n"
         "def record_build_stage(*args, **kwargs): pass\n"
         "def record_skip(*args, **kwargs): pass\n"
+        "def record_fact(*args, **kwargs): pass\n"
+        "def persist_running_receipt(): pass\n"
         "TAIL_FOLLOWUPS = frozenset({'dependencies', 'launchers', 'build', 'maintenance', 'profile_sync',\n"
         "                            'config_migration', 'completion'})\n"
         "finalized_receipt = lambda update_id: None\n"
@@ -390,7 +396,7 @@ def test_unwritable_gateway_status_never_fails_a_settled_commit(tmp_path, monkey
     ``_write_gateway_update_exit_code``; the committed run still answers its result with exit 0."""
     from hermes_cli import venv_sync
 
-    monkeypatch.setattr(venv_sync, "arm_completion", lambda root: None)
+    monkeypatch.setattr(venv_sync, "arm_completion", lambda root, **kwargs: None)
     receipt = {"update_id": "u1", "outcome": "success", "finished_at": "now"}
     monkeypatch.setattr(update_completion, "_read_terminal_receipt", lambda request: receipt)
     home = tmp_path / "home-is-a-file"
@@ -535,7 +541,7 @@ def test_failed_build_after_commit_is_a_followup_and_later_steps_still_run(trans
     # The failure is not silent: it is a named receipt follow-up.
     assert [f["step"] for f in result["receipt"]["followups"]] == ["build"]
     # The tail obligation stays armed so the next launch / `hermes update` rebuilds.
-    assert (Path(request["home"]) / "completion-pending").read_text() == "owed"
+    assert (Path(request["home"]) / "completion-pending").read_text() == "source update tail not finished\n"
     events = [json.loads(line)["name"] for line in (root / "events.jsonl").read_text().splitlines()]
     # Was "not in": the failed build no longer skips maintenance (config migration) ...
     assert "maintenance" in events
@@ -567,7 +573,7 @@ def test_prepare_failure_preserves_correlated_pm_receipt(transition):
     assert result["receipt"]["outcome"] == "success"
     assert [f["step"] for f in result["receipt"]["followups"]] == ["dependencies"]
     assert "dependency refused" in result["receipt"]["followups"][0]["reason"]
-    assert (Path(request["home"]) / "completion-pending").read_text() == "owed"
+    assert (Path(request["home"]) / "completion-pending").read_text() == "source update tail not finished\n"
     assert result["pm_receipt"] == {"update_id": request["receipt"]["update_id"], "outcome": "refused",
                                     "refusal": {"reason": "dependency refused"}}
 

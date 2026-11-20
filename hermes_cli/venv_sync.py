@@ -120,9 +120,10 @@ def sync(project_root: Path | None = None, *, check: bool = False) -> dict:
         publish_stage("Updating Python dependencies")
         refuse_foreign_owned_venv(root)
         from pm.extras import first_generation_selection
+        from hermes_cli.maintenance_scope import resolve_scope
 
         pm.sync_venv(first_generation_selection(root), explicit=True, project_root=root,
-                     evict_incompatible_plugins=True)
+                     evict_incompatible_plugins=resolve_scope(root).mode == "all")
         collect_superseded_generations(root)
         publish_launchers(root)
         return {"state": "synced", "ok": True}
@@ -176,11 +177,17 @@ def completion_pending_path(project_root: Path) -> Path:
     return install_state_dir(project_root) / "source-completion-pending"
 
 
-def arm_completion(project_root: Path) -> Path:
-    """Persist the tail obligation before selecting a new dependency generation."""
+def arm_completion(project_root: Path, *, maintenance_scope=None) -> Path:
+    """Persist scope with the tail obligation; a re-arm must never broaden it."""
+    import json
+    from hermes_cli.maintenance_scope import resolve_scope
+    from pm.filesystem import durable_write_bytes
+    scope = resolve_scope(project_root, maintenance_scope)
     pending = completion_pending_path(project_root)
     pending.parent.mkdir(parents=True, exist_ok=True)
-    pending.write_text("source update tail not finished\n", encoding="utf-8")
+    payload = (json.dumps({"schema": 1, "maintenance_scope": scope.to_dict()}) + "\n"
+               if scope.mode == "default" else "source update tail not finished\n")
+    durable_write_bytes(pending, payload.encode("utf-8"))
     return pending
 
 
@@ -426,6 +433,15 @@ def _relaunch_target(root: Path, python: Path, *, same: bool) -> Path | None:
 
 
 def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
+    # Launch repair runs before the application parser. Honour the public scope
+    # here too, before adoption, dependency preparation or an interrupted tail.
+    from hermes_cli.maintenance_scope import resolve_launch_scope, maintenance_scope
+    scope = resolve_launch_scope(Path(project_root), argv)
+    with maintenance_scope(scope):
+        return _prepare_launch_scoped(project_root, argv)
+
+
+def _prepare_launch_scoped(project_root: Path, argv: list[str]) -> Path | None:
     """Finish a self-managed source update before importing app dependencies.
 
     PM's successful input stamp signals a finished dependency sync; the
@@ -577,6 +593,8 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
     from hermes_cli._early_recovery import _marker_owner_is_live
     from pm.environments import activation_environment
 
+    from hermes_cli.maintenance_scope import resolve_scope
+    scope = resolve_scope(root)
     if not current:
         # Existing markers guard liveness, never create the completion obligation.
         # Current post-sync verification children can boot under a live updater.
@@ -584,7 +602,7 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         if any(_marker_owner_is_live(marker) for marker in legacy_markers):
             raise RuntimeError("an update is still running; wait for it to exit, then relaunch Hermes")
         print("hermes: completing source-update dependencies...", file=sys.stderr, flush=True)
-        completed = _tree_matches_completed_stamp(root)
+        completed = scope.mode == "all" and _tree_matches_completed_stamp(root)
         # ponytail: commit-only match; a product dir deleted by hand is rebuilt on demand
         # by its own entry point (the TUI/web freshness gates), not here.
         try:
@@ -600,7 +618,7 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         if completed:
             clear_completion(root)
             return
-    elif _tree_matches_completed_stamp(root):
+    elif scope.mode == "all" and _tree_matches_completed_stamp(root):
         # The stamp names HEAD, so the last install/update already built this tree:
         # a pending marker is a leftover from a previous home/install, not an
         # interrupted update, and owing nothing is quieter than announcing one.
@@ -630,7 +648,7 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         code = run(
             [sys.executable, "-I", "-B", "-u",
              str(root / "hermes_cli/source_completion.py"),
-             "--source", str(root), "--finish-update",
+             "--source", str(root), "--finish-update", *scope.cli_args(),
              *(("--desktop",) if desktop else ())],
             inherit_lock=True, cwd=root, env=activation_environment(root), stdout=sys.__stderr__,
         ).returncode
@@ -661,6 +679,8 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
               f"{borrowed_from})...", file=sys.stderr, flush=True)
     elif not arm:
         print("hermes: preparing dependencies for this update...", file=sys.stderr, flush=True)
+    from hermes_cli.maintenance_scope import resolve_scope
+    scope = resolve_scope(root)
     refuse_foreign_owned_venv(root)
     if arm:
         # Owed from before the sync commits: a crash between the commit and the
@@ -672,7 +692,8 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
     # Same order as `hermes update`: an interrupted update or a hand-run
     # `git pull` leaves this tree's lockfile ahead of the installed tools.
     ensure_tools_for_sync()
-    pm.sync_venv(extras, explicit=True, project_root=root, evict_incompatible_plugins=True)
+    pm.sync_venv(extras, explicit=True, project_root=root,
+                 evict_incompatible_plugins=scope.mode == "all")
     collect_superseded_generations(root)
     if borrowed_from is not None:
         return  # The checkout's markers describe the owner's environment, not this one.

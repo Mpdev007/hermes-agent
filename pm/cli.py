@@ -1020,6 +1020,10 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("install", help="install packages (default: all required + optional defaults)")
     p.add_argument("names", nargs="*")
+    p.add_argument("--maintenance-scope", choices=("all", "default"), default=None,
+                   help="limit profile-data writes to the canonical default profile; tools, runtime "
+                        "and the enabled-plugin dependency union remain shared. Pending scoped "
+                        "work retains its restriction when this flag is omitted")
     p.add_argument("--extra", action="append", default=[], metavar="NAME",
                    help="enable a declared dependency extra in the venv (repeatable)")
     p.add_argument("--without", action="append", default=[], metavar="NAME",
@@ -1094,11 +1098,27 @@ def main(argv=None) -> int:
     if args.cmd == "lock" and (args.name is None) != (args.version is None):
         lock_parser.error("--bump NAME and VERSION go together; run with neither to relock uv.lock")
     from pm.runtime import is_runtime, run_cli
+    from hermes_cli.maintenance_scope import (
+        ScopeSafetyRefusal, maintenance_scope, publication_scope,
+    )
 
     try:
-        if not is_runtime():
-            return run_cli(list(sys.argv[1:] if argv is None else argv))
-        return args.func(args)
+        # Direct `python -m pm.cli install` has no hermes_bootstrap prologue.
+        # Bind before runtime provisioning or any install action. Recovery is
+        # still native and checks the journal under the same install lock.
+        scope = publication_scope(repo_root(), getattr(args, "maintenance_scope", None))
+        with maintenance_scope(scope):
+            if not is_runtime():
+                carried = list(sys.argv[1:] if argv is None else argv)
+                if args.cmd == "install" and args.maintenance_scope is None:
+                    # Freeze even flagless pending selection at the fresh
+                    # interpreter boundary; loss of a marker cannot widen it.
+                    carried.extend(scope.cli_args())
+                return run_cli(carried)
+            return args.func(args)
+    except ScopeSafetyRefusal as exc:
+        print(f"hermes pm: maintenance scope refused: {exc}", file=sys.stderr)
+        return 1
     except InstallError as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 1

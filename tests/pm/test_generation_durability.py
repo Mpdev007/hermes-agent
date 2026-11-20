@@ -6,13 +6,21 @@ the page cache, and the next boot selects a half-written environment.
 from __future__ import annotations
 
 import os
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def no_real_flush(monkeypatch):
+    import ctypes
+    monkeypatch.setattr(os, "sync", lambda: pytest.fail("unexpected global sync"), raising=False)
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: pytest.fail("unexpected real syncfs binding"))
 
 
 def _flush_probe(monkeypatch, observe):
-    """Replace the filesystem-wide flush with one that records what was on disk
-    when it ran; ``raising=False`` so the contract is exercised on Windows too."""
+    """Replace the scoped barrier without running a real sync on any platform."""
+    from pm import durability
     seen: list = []
-    monkeypatch.setattr(os, "sync", lambda: seen.append(observe()), raising=False)
+    monkeypatch.setattr(durability, "flush_filesystems", lambda roots: seen.append(observe()))
     return seen
 
 
@@ -23,6 +31,7 @@ def test_install_selection_is_committed_only_after_its_tree_is_flushed(tmp_path,
 
     store = tmp_path / "tools"
     store.mkdir()
+    monkeypatch.setattr("pm._uv._toolchain", lambda **kw: (store / "uv", store / "python"))
     monkeypatch.setattr("pm.paths.store_root", lambda: store)
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -56,7 +65,7 @@ def test_side_environment_selection_is_committed_only_after_its_tree_is_flushed(
     base = tmp_path / "base" / "python"
     base.parent.mkdir()
     base.touch()
-    monkeypatch.setattr(_uv, "_toolchain", lambda **kwargs: (None, base))
+    monkeypatch.setattr(_uv, "_toolchain", lambda **kwargs: (base.parent / "uv", base))
     root = tmp_path / "side"
     built: list = []
 

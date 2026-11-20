@@ -97,6 +97,9 @@ def _raise_worker_error(error: dict):
     if error["type"] == "DownloadPaused":
         from pm.downloader import DownloadPaused
         raise DownloadPaused(error["message"])
+    if error["type"] == "ScopeSafetyRefusal":
+        from hermes_cli.maintenance_scope import ScopeSafetyRefusal
+        raise ScopeSafetyRefusal(error["message"])
     raise _WORKER_ERRORS.get(error["type"], RuntimeError)(error["message"])
 
 
@@ -110,13 +113,15 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     spec = OPERATIONS[operation]
     names = list(spec.packages) if spec.packages is not None else (
         arguments["names"] if "names" in arguments else [arguments["name"]])
+    from hermes_cli.maintenance_scope import publication_scope
+    scope = publication_scope(Path(project_root) if project_root is not None else paths.repo_root())
     message = {
         "id": request_id, "operation": operation, "arguments": arguments,
         "update_id": update_id,
         "callbacks": list(callbacks),
         "packages": package_definitions(names),
         "context": {"repo": str(Path(project_root).absolute() if project_root is not None else paths.repo_root()),
-                    "lockfile": str(paths.lockfile_path())},
+                    "lockfile": str(paths.lockfile_path()), "maintenance_scope": scope.to_dict()},
     }
     worker = Path(__file__).with_name("worker.py").resolve()
     environment = runtime_environment()

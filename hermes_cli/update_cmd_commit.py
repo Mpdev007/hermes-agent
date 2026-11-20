@@ -233,6 +233,8 @@ def arm_commit_point(git_cmd, root: Path, expected_sha: str, **move) -> str | No
     (``disarm_commit_obligations``), and the caller must stop before git writes a file.
     Linux/macOS gateways are paused first: this is every route's first checkout move.
     """
+    if refused := scope_target_refusal(git_cmd, root, move.get("target", expected_sha)):
+        return refused
     from hermes_cli.update_cmd_posix_pause import pause_at_commit_point
     if refused := pause_at_commit_point():
         return refused
@@ -679,6 +681,18 @@ def run_checkout_untouched(root: Path) -> bool:
     return checkout_untouched(_run_start[0], Path(root), _run_start[1])
 
 
+def scope_target_refusal(git_cmd, root: Path, target_ref: str) -> str | None:
+    from hermes_cli.maintenance_scope import current_scope, require_scope_target
+    if current_scope().mode == "all":
+        return None
+    rel = "hermes_cli/maintenance_scope.py"
+    try:
+        require_scope_target(read_target_files(git_cmd, root, target_ref, [rel]).get(rel))
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return f"✗ {exc}"
+    return None
+
+
 def preflight_refusal(git_cmd, root: Path, target_ref: str, critical_files) -> str | None:
     """Why this update must not start, checked BEFORE the first tree move; ``None`` to proceed.
 
@@ -696,6 +710,8 @@ def preflight_refusal(git_cmd, root: Path, target_ref: str, critical_files) -> s
         except Exception as exc:  # health: allow BLE001 -- fail closed: any probe error refuses before the first move
             _record_stop("venv_foreign_owner")
             return f"✗ {exc}"  # pm's refusal carries its own remediation text
+    if refused := scope_target_refusal(git_cmd, root, target_ref):
+        return refused
     broken = target_syntax_error(git_cmd, root, target_ref, critical_files)
     if broken is not None:
         path, error = broken

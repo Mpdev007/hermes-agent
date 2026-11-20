@@ -134,6 +134,9 @@ def _pending_provider(home: Path, *, say: Callable[[str], None]) -> Optional[str
     if is_core_memory_provider(name) or provider_present(name, home):
         return None
     if catalog_source(name) is None:
+        from hermes_cli.maintenance_scope import current_scope
+        if current_scope().mode == "default":
+            raise RuntimeError(f"configured memory provider {name!r} is absent from the catalog")
         say(f"  ⚠ Memory provider '{name}' is configured but not installed and not in the plugin catalog. "
             f"Install it with `hermes plugins install <source>` or change memory.provider.")
         return None
@@ -244,11 +247,14 @@ def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
         return lambda message: say(f"  [{_home_label(home)}] {message.lstrip()}")
 
     pending: dict[tuple[str, bool], list[Path]] = {}
-    for home in dependency_homes():
+    from hermes_cli.maintenance_scope import current_scope
+    for home in current_scope().homes(dependency_homes()):
         try:
             name = _pending_provider(home, say=labelled(home))
             consent = bool(name) and _home_consent(home)
         except Exception as exc:
+            if current_scope().mode == "default":
+                raise
             logger.debug("memory provider migration skipped for %s: %s", home, exc)
             continue
         if name:
@@ -266,6 +272,8 @@ def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
                     if _install_pending(home, name, install=_install_into(home), say=labelled(home)):
                         installed.append(name)
                         continue
+                    if current_scope().mode == "default":
+                        raise RuntimeError("default profile plugin migration remains incomplete")
                     rest = homes[index + 1:]
                     if rest:
                         say(f"  ⚠ Memory provider '{name}' was not installed for "
@@ -273,6 +281,8 @@ def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
                             + ", ".join(f"`{_install_command(name, h)}`" for h in rest) + ".")
                     break
     except KeyboardInterrupt:
+        if current_scope().mode == "default":
+            raise
         say("  ⚠ Memory provider migration cancelled. Profiles already migrated keep their plugin; "
             "run `hermes plugins install <name>` (with `-p <profile>`) for the rest.")
     return installed

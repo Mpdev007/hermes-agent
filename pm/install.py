@@ -891,8 +891,16 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
             change.publish(paths.repo_root())
         if not current:
             if result.get("environment") is not None:
+                from pm.durability import generation_roots
                 from pm.environments import flush_before_selecting
-                flush_before_selecting()
+                from pm.publication import StagedPlugin
+
+                roots = generation_roots(Path(result["environment"]))
+                if isinstance(change, StagedPlugin):
+                    roots += (change.target, change.metadata)
+                # PluginSelection/PluginEviction write their config records via
+                # durable_write_bytes already; only StagedPlugin adds code trees.
+                flush_before_selecting(*roots)
             facts.record_state("venv", stamp, enabled, **result)
         if change is not None:
             finish_publication(paths.repo_root())
@@ -947,12 +955,24 @@ def decline_extras(names: list[str]) -> None:
 
 
 def _sync_locked(extras, *, package, plugins, repair: bool, explicit: bool, shipped, frozen,
-                 evict_incompatible_plugins: bool) -> None:
+                 evict_incompatible_plugins: bool, scope=None) -> None:
     """sync_venv's body under the held dependency lock."""
     from pm import receipt
     from pm.publication import StagedPlugin
 
     change = _publication(plugins)
+    if scope is not None and scope.mode == "default" and change is not None:
+        from hermes_cli.maintenance_scope import ScopeSafetyRefusal
+        home = Path(scope.home)
+        if isinstance(change, StagedPlugin):
+            allowed = (change.target.parent == home / 'plugins'
+                       and change.target.resolve().parent == home / 'plugins'
+                       and change.metadata.resolve() == home / 'plugins' / '.install-metadata.json'
+                       and not change.target.name.startswith('.'))
+        else:
+            allowed = change.path == home / 'config.yaml' and change.path.resolve() == change.path
+        if not allowed:
+            raise ScopeSafetyRefusal("default-only maintenance cannot publish foreign profile data")
     if isinstance(change, StagedPlugin) and not change.active:
         _publish_inactive(change)
     elif evict_incompatible_plugins:
@@ -1023,10 +1043,16 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
         package = get_package("venv")
         from hermes_cli.runtime_state import recover_publication
         from functools import partial
+        from hermes_cli.maintenance_scope import maintenance_scope, publication_scope, ScopeSafetyRefusal
+        scope = publication_scope(paths.repo_root())
         sync = partial(_sync_locked, package=package, plugins=plugins, repair=repair, explicit=explicit,
-                       shipped=shipped, frozen=frozen, evict_incompatible_plugins=evict_incompatible_plugins)
+                       shipped=shipped, frozen=frozen, evict_incompatible_plugins=evict_incompatible_plugins,
+                       scope=scope)
         automatic = [*(automatic or ()), *(carried or ())]  # a carried extra is automatic too
-        with _venv_install_lock(patient=explicit or repair):
+        with _venv_install_lock(patient=explicit or repair), maintenance_scope(
+                publication_scope(paths.repo_root(), scope)):
+            if scope.mode == "default" and evict_incompatible_plugins:
+                raise ScopeSafetyRefusal("default-only maintenance cannot evict shared dependency plugins")
             if not repair:
                 from pm.carried_extras import with_pre_pm_baseline
 

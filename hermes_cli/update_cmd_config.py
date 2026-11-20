@@ -191,6 +191,9 @@ def _check_and_apply_config_migration(
         logger.debug("Config check during update failed: %s", exc)
         print("  ⚠️  Could not check config version.")
         print("     Run 'hermes config migrate' to check manually.")
+        from hermes_cli.maintenance_scope import current_scope
+        if current_scope().mode == "default":
+            raise RuntimeError("default profile configuration could not be checked") from exc
         return
 
     # Why this update still owes migration steps (the active profile's stop or failed write, each

@@ -540,6 +540,25 @@ def _settle_interrupted_update() -> None:
         recovery.relaunch_after_restore()
 
 
+# Scope is a safety precondition, not a recoverable dependency-build failure.
+# Validate it before dependency/publication repair or legacy post-swap dispatch.
+try:
+    from hermes_cli.maintenance_scope import ScopeSafetyRefusal, resolve_launch_scope
+
+    try:
+        resolve_launch_scope(_root, sys.argv[1:])
+    except ScopeSafetyRefusal as exc:
+        print(f"hermes: maintenance scope refused: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+except (ImportError, SyntaxError):
+    # Scope lookup itself imports checkout code (including hermes_constants).
+    # A killed Git/ZIP write must not strand the stdlib-only source restoration.
+    # This uses native custody and attribution, and reexecs a restored tree so
+    # the SAME argv/pending scope is checked again before any profile maintenance.
+    # No restoration/reexec means no scope verdict: fail closed, never assume all.
+    _settle_interrupted_update()
+    raise
+
 _settle_interrupted_update()
 
 # After the repair above: a merge killed while writing hermes_agent/ must not keep the repair from running.
@@ -601,6 +620,9 @@ if not _pm_repair:
 
                 raise RelaunchExit(subprocess.call(_command))
             os.execv(str(_launch_python), _command)
+    except ScopeSafetyRefusal as exc:
+        print(f"hermes: maintenance scope refused: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
     except Exception as exc:
         if isinstance(exc, PermissionError) and (message := install_state_permission_message(_root, exc)):
             print(f"hermes: {message}", file=sys.stderr)
@@ -613,8 +635,16 @@ if not _pm_repair:
               "running with the previous dependencies — run `hermes update` to finish it",
               file=sys.stderr)
     try:
-        recover_if_needed(_root)
-        activate_dependencies(_root)
+        # A failed prepare may have left a new obligation (or a publication
+        # appeared while it ran). Re-read authority before either fallback,
+        # rather than trusting an unwound context or the earlier preflight.
+        from hermes_cli.maintenance_scope import maintenance_scope
+        with maintenance_scope(resolve_launch_scope(_root, sys.argv[1:])):
+            recover_if_needed(_root)
+            activate_dependencies(_root)
+    except ScopeSafetyRefusal as exc:
+        print(f"hermes: maintenance scope refused: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
     except (RuntimeError, OSError) as exc:
         if isinstance(exc, PermissionError) and (message := install_state_permission_message(_root, exc)):
             print(f"hermes: {message}", file=sys.stderr)

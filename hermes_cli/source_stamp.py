@@ -45,6 +45,8 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
         "payload": "bootstrap",
         "tag": None,
     }
+    from hermes_cli.maintenance_scope import current_scope
+    stamp["maintenance_scope"] = current_scope().to_dict()
     if adopted:
         stamp["adoptedAt"] = stamp["builtAt"]
     stamp_path = root / "install-stamp.json"
@@ -96,6 +98,7 @@ def refresh_bootstrap_receipt(root: Path, stamp: dict) -> None:
         **previous,
         "schemaVersion": 1,
         "pinnedCommit": stamp["commit"],
+        "maintenance_scope": stamp.get("maintenance_scope", {"mode": "all", "home": None}),
         # A detached checkout keeps the branch it was installed from.
         "pinnedBranch": stamp["branch"] or previous.get("pinnedBranch"),
         "completedAt": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",

@@ -524,6 +524,10 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
         # under the interpreter the target admits (``startup_syntax_error``, review N15).
         if broken := _commit.tree_syntax_error(Path(extracted), _UPDATE_CRITICAL_FILES):
             raise SyntaxError(f"{broken[0]}: {broken[1]}")
+        from hermes_cli.maintenance_scope import current_scope, require_scope_target
+        if current_scope().mode == "default":
+            capability = Path(extracted) / "hermes_cli/maintenance_scope.py"
+            require_scope_target(capability.read_bytes() if capability.is_file() else None)
         # The commit point: tail + fleet restart owed before the first live rename.
         _commit.arm_commit_obligations(root, target_sha or "")
         for entry in journal_entries:

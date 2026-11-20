@@ -1618,6 +1618,9 @@ def _sibling_profile_homes(invoking_home: Path) -> list[tuple[str, Path]]:
     so the pre-update snapshot must too (#66140). The invoking profile is
     excluded — its snapshot is taken by the existing call.
     """
+    from hermes_cli.maintenance_scope import current_scope
+    if current_scope().mode == "default":
+        return []
     homes: list[tuple[str, Path]] = []
     try:
         from hermes_cli.profiles import (

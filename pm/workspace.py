@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -26,6 +27,24 @@ _MEMBER_EXCLUDE = frozenset({".git", ".venv", "venv", "node_modules", "__pycache
 
 def _member_ignored(directory, names):
     return [name for name in names if name in _MEMBER_EXCLUDE or name.endswith(".egg-info")]
+
+
+def _make_build_snapshot_writable(root: Path) -> None:
+    """Permit owner writes only in a fresh copy, never through copied symlinks.
+
+    copytree/copy2 preserve read-only input modes. Build backends need to write
+    metadata in their private generation; original source remains untouched.
+    Call only after copying into a newly created native workspace.
+    """
+    if not stat.S_ISDIR(root.lstat().st_mode):
+        raise InstallError("venv", "build snapshot root must be a real directory")
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        for path in [Path(directory), *(Path(directory) / name for name in dirs + files)]:
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                path.chmod(stat.S_IMODE(mode) | stat.S_IWUSR | stat.S_IXUSR)
+            elif stat.S_ISREG(mode):
+                path.chmod(stat.S_IMODE(mode) | stat.S_IWUSR)
 
 
 # The uv failure classifier lives beside the uv runner (stdlib-only imports): the bootstrap
@@ -145,6 +164,7 @@ def _copy_core_inputs(source: Path, destination: Path) -> None:
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(entry, target)
+    _make_build_snapshot_writable(destination)
 
 
 def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Path, *, source: Path,
@@ -622,6 +642,7 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path, extras: I
         member = root / "plugin-sources" / key
         shutil.copytree(plugin_dir, member, symlinks=True,
                         ignore=_member_ignored)
+        _make_build_snapshot_writable(member)
         document = tomllib.loads(pyproject.read_text(encoding="utf-8-sig"))
         # uv identifies a workspace member by [project].name, so the same virtual
         # plugin enabled in two profiles would declare one name twice and fail
@@ -884,6 +905,7 @@ def lock_and_sync(
         # snapshotted members and their exact lock travel with the workspace.
         # Use the snapshot's exclusions: build/ may hold an in-tree backend.
         shutil.copytree(replay, root, symlinks=True, ignore=_member_ignored)
+        _make_build_snapshot_writable(root)
         # A generation recorded before the cutoff left the user's machine still carries it.
         manifest = root / "pyproject.toml"
         manifest.write_text(_without_release_age(manifest.read_text(encoding="utf-8-sig")), encoding="utf-8")

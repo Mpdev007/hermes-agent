@@ -260,7 +260,7 @@ def _unstamped_store(project_root: Path) -> Path:
     return (owning_home_root(project_root) or get_default_hermes_root()) / "tools"
 
 
-def flush_before_selecting() -> None:
+def flush_before_selecting(*roots: Path) -> None:
     """Make a finished generation tree durable before a selection record names it.
 
     The selection record (the install's facts.json, a side environment's
@@ -268,8 +268,11 @@ def flush_before_selecting() -> None:
     generation's completion marker -- but only if every file it vouches for
     reached the disk first. Otherwise a power loss can persist the record while
     the tree's data is still in the page cache, selecting a half-written venv.
-    One filesystem-wide sync instead of an fsync per file: a venv holds tens of
-    thousands of files, and per-file flushes cost minutes on slow disks.
+    On Linux flush each distinct filesystem of the explicitly named generation
+    and its runtime/tool payloads, not unrelated mounted devices. The helper
+    also discovers nested mounts, symlink targets and editable source trees.
+    Any discovery/binding/writeback error must prevent the selection write.
+    Per-filesystem barriers avoid tens of thousands of per-file fsync calls.
 
     Windows has no whole-filesystem flush reachable from Python (os.sync does
     not exist there), and FlushFileBuffers per file is the slow path rejected
@@ -277,9 +280,9 @@ def flush_before_selecting() -> None:
     torn, but NTFS journals metadata, not file contents, so power loss right
     after a publish can still leave the selected tree with incomplete files.
     """
-    sync = getattr(os, "sync", None)
-    if sync is not None:
-        sync()
+    from pm.durability import flush_filesystems
+
+    flush_filesystems(roots)
 
 
 def selected_venv(project_root: Path) -> Path:

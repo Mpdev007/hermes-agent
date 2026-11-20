@@ -106,7 +106,11 @@ def main():
             for name in ("progress", "download_progress"):
                 if name in request["callbacks"]:
                     arguments[name] = lambda *args, name=name: callback(name, *args)
-            result = implementation(**arguments)
+            from hermes_cli.maintenance_scope import MaintenanceScope, maintenance_scope, publication_scope
+            carried = (MaintenanceScope.from_dict(context["maintenance_scope"])
+                       if "maintenance_scope" in context else None)
+            with maintenance_scope(publication_scope(paths.repo_root(), carried)):
+                result = implementation(**arguments)
             if request["operation"] == "ensure":
                 result = None  # Runner is reconstructed from the caller's base env.
             if isinstance(result, Path):

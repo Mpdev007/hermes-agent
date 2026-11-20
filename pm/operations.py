@@ -310,8 +310,9 @@ def _ensure_generation(
             python = build(generation, base_python)
             if executable is not None and _tool(python, executable) is None:
                 raise InstallError(name, f"installed requirements do not provide {executable!r}")
+            from pm.durability import generation_roots
             from pm.environments import flush_before_selecting
-            flush_before_selecting()
+            flush_before_selecting(*generation_roots(generation / "venv", python=base_python))
             _write(root / "active.json", {"generation": generation.name,
                                            "inputs": identity(base_python), **record})
         except BaseException:

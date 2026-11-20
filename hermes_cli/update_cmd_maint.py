@@ -828,6 +828,12 @@ def _profile_skill_sync_status(r) -> str:
 
 def _sync_profiles_after_update() -> None:
     """Best-effort per-profile syncs: bundled skills, ``.env`` backfill."""
+    from hermes_cli.maintenance_scope import current_scope
+    if current_scope().mode == "default":
+        # Active skills/config have their own ordinary steps.
+        from hermes_cli.update_receipt import record_skip
+        record_skip("sibling_profile_sync", "default-only maintenance; named profiles excluded")
+        return
     # All profiles incl. the active one: seed_profile_skills() subprocesses with an explicit
     # HERMES_HOME, so sync_skills()'s module-level HERMES_HOME cache can't skew it.
     with suppress(Exception):
@@ -957,7 +963,14 @@ def _migrate_relay_exporter_env() -> None:
     run_relay_migration_after_update()
 
 
-def _run_post_update_maintenance(
+def _run_post_update_maintenance(*, maintenance_scope=None, **options) -> bool:
+    from hermes_cli.maintenance_scope import resolve_scope, maintenance_scope as bind_scope
+    from hermes_cli.update_cmd import _m
+    with bind_scope(resolve_scope(_m().PROJECT_ROOT, maintenance_scope)):
+        return _run_post_update_maintenance_scoped(**options)
+
+
+def _run_post_update_maintenance_scoped(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, had_desktop_app_before_update,
     pre_update_version, completion_message=None, followups=None,
 ) -> bool:
@@ -1043,10 +1056,14 @@ def _run_post_update_maintenance(
     with _best_effort('Plugin catalog update notice failed: %s'):
         _report_catalog_plugin_updates()
 
-    with _best_effort('Skills sync during update failed: %s'):
-        print()
-        print("→ Syncing bundled skills...")
-        _print_bundled_skills_sync_report()
+    from hermes_cli.maintenance_scope import current_scope
+    print()
+    print("→ Syncing bundled skills...")
+    if current_scope().mode == "default":
+        owed_step("maintenance", _print_bundled_skills_sync_report)
+    else:
+        with _best_effort('Skills sync during update failed: %s'):
+            _print_bundled_skills_sync_report()
 
     owed_step("profile_sync", _sync_profiles_after_update)
 
@@ -1055,9 +1072,15 @@ def _run_post_update_maintenance(
     ))
     # Catalog plugins marked ``default: true`` that a profile never had: a fresh install's home, or a
     # default added since the last update. A failed fetch is retried from a later boot, so nothing is owed.
-    with _best_effort('Default plugin install failed: %s'):
-        from hermes_cli.default_plugins import install_and_record
-        install_and_record()
+    if current_scope().mode == "default":
+        # Port adaptation A2 (v0.23.3 default plugins): this pass installs into every profile home and
+        # marks the revision settled; default-only maintenance neither reaches named profiles nor settles.
+        from hermes_cli.update_receipt import record_skip
+        record_skip("default_plugins", "default-only maintenance; all-home default plugin install excluded")
+    else:
+        with _best_effort('Default plugin install failed: %s'):
+            from hermes_cli.default_plugins import install_and_record
+            install_and_record()
 
     print()
     update_complete = _print_verified_update_completion(completion_message or _update_complete_message(pre_update_version))

@@ -206,7 +206,14 @@ def _headless_linux() -> bool:
     return sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def build_update_products(project_root: Path, *, desktop: bool, after_dependencies=None) -> None:
+def build_update_products(project_root: Path, *, desktop: bool, after_dependencies=None,
+                          maintenance_scope=None) -> None:
+    from hermes_cli.maintenance_scope import resolve_scope, maintenance_scope as bind_scope
+    with bind_scope(resolve_scope(project_root, maintenance_scope)):
+        _build_update_products_scoped(project_root, desktop=desktop, after_dependencies=after_dependencies)
+
+
+def _build_update_products_scoped(project_root: Path, *, desktop: bool, after_dependencies=None) -> None:
     """Prepare the selected union once, attempting every independent product.
 
     A failed product never skips the next one (a broken web build must not leave the TUI or the
@@ -217,6 +224,7 @@ def build_update_products(project_root: Path, *, desktop: bool, after_dependenci
     # Both current updates and historical takeover reach this in a fresh target
     # interpreter, never in the updater's pre-sync import graph.
     from hermes_cli.main_install_repair import _install_configured_features_missing_deps
+    from hermes_cli.maintenance_scope import ScopeSafetyRefusal
     from hermes_cli.update_stage import publish_stage
 
     failures: list[tuple[str, BaseException]] = []
@@ -226,6 +234,8 @@ def build_update_products(project_root: Path, *, desktop: bool, after_dependenci
         try:
             step()
             return True
+        except ScopeSafetyRefusal:
+            raise  # authority failure is fatal, not an independent product failure
         except Exception as exc:  # health: allow BLE001 -- collected and raised after the independent steps
             print(f"  ⚠ {name} failed: {_failure_text(exc)}")
             failures.append((name, exc))
@@ -300,16 +310,26 @@ def build_update_products(project_root: Path, *, desktop: bool, after_dependenci
         from hermes_cli.memory_provider_migration import migrate_all_homes
 
         migrate_all_homes()
+    except ScopeSafetyRefusal:
+        raise
     except Exception as exc:  # health: allow BLE001 -- post-commit boundary: printed as ⚠, never fails the committed update; every later update/tail re-runs it
         print(f"  ⚠ Memory provider migration skipped: {exc}")
+        from hermes_cli.maintenance_scope import current_scope
+        if current_scope().mode == "default":
+            failures.append(("profile migration", exc))
     # Same for a gateway platform / toolset that left core (Home Assistant): every home that used
     # it gets its catalog plugin (hermes_cli/left_core_migration.py).
     try:
         from hermes_cli.left_core_migration import migrate_all_homes as migrate_left_core
 
         migrate_left_core()
+    except ScopeSafetyRefusal:
+        raise
     except Exception as exc:  # health: allow BLE001 -- post-commit boundary: printed as ⚠, never fails the committed update; every later update/tail re-runs it
         print(f"  ⚠ Plugin migration skipped: {exc}")
+        from hermes_cli.maintenance_scope import current_scope
+        if current_scope().mode == "default":
+            failures.append(("profile migration", exc))
     if failures:
         raise ProductBuildError(failures)
 

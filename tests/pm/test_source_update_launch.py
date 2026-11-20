@@ -147,7 +147,7 @@ def test_source_python_pin_update_survives_real_gc(source_launch, tmp_path, monk
         assert venv_sync.prepare_launch(root, []) == new_python
         # The heal finished the whole tail, with update wording, through the checkout's own completion.
         calls = [json.loads(line) for line in (tmp_path / "completion-calls").read_text().splitlines()]
-        assert calls == [["--source", str(root), "--finish-update"]]
+        assert calls == [["--source", str(root), "--finish-update", "--maintenance-scope", "all"]]
     elif update == "sync":
         # This is the PM sync -> launcher publication sequence now split across
         # update_completion._prepare and _complete_selected. The former checkout

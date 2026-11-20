@@ -381,7 +381,7 @@ def test_disarm_restores_through_an_unpredictable_temp_and_leaves_every_sibling(
 
     tail = completion_pending_path(root)
     tail.parent.mkdir(parents=True, exist_ok=True)
-    tail.write_bytes(b"OLD-TAIL")
+    tail.write_bytes(b"source update tail not finished\n")
     sentinel = tmp_path / "sentinel"
     sentinel.write_bytes(b"PRECIOUS")
     commit.arm_commit_obligations(root, "a" * 40)
@@ -395,7 +395,7 @@ def test_disarm_restores_through_an_unpredictable_temp_and_leaves_every_sibling(
 
     commit.disarm_commit_obligations()
 
-    assert tail.read_bytes() == b"OLD-TAIL" and not tail.is_symlink()
+    assert tail.read_bytes() == b"source update tail not finished\n" and not tail.is_symlink()
     assert sentinel.read_bytes() == b"PRECIOUS"
     if kind == "regular":
         assert planted.read_bytes() == b"USER-FILE"

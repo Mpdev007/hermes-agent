@@ -117,4 +117,9 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help="Update code and dependencies but defer the fleet restart. Use for updates "
              "running inside a gateway cgroup, then restart gateways separately.",
     )
+    update_parser.add_argument(
+        "--maintenance-scope", choices=("all", "default"), default=None,
+        help="Limit profile-data maintenance to the canonical default profile. "
+             "Shared code/runtime/dependencies still update. Default preserves all-profile behavior; "
+             "pending scoped work retains its scope. default requires --no-gateway-restart.")
     update_parser.set_defaults(func=cmd_update)

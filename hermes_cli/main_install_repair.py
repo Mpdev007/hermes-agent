@@ -288,7 +288,11 @@ def _install_configured_features_missing_deps(project_root: Path) -> None:
     import pm
     from pm.extras import declined_extras, extra_supported
     from pm.features import declared_extras
+    from hermes_cli.maintenance_scope import resolve_scope
 
+    # Re-resolve the persisted obligation too: fresh build children need not
+    # inherit an in-process scope context. Refuse before any PM mutation.
+    scope = resolve_scope(project_root)
     missing = _configured_features_missing_deps()
     if not missing:
         return
@@ -299,9 +303,14 @@ def _install_configured_features_missing_deps(project_root: Path) -> None:
     if extras:
         try:
             # Config asked for these, not the user: a `--without` landing before the PM lock still wins.
-            pm.sync_venv(extras, explicit=True, project_root=project_root, evict_incompatible_plugins=True,
-                         automatic=extras)
+            from hermes_cli.maintenance_scope import maintenance_scope
+            with maintenance_scope(scope):
+                pm.sync_venv(extras, explicit=True, project_root=project_root,
+                             evict_incompatible_plugins=scope.mode == "all", automatic=extras)
         except Exception as exc:
+            from hermes_cli.maintenance_scope import ScopeSafetyRefusal
+            if scope.mode == "default" or isinstance(exc, ScopeSafetyRefusal):
+                raise
             print(f"  ⚠ Could not install {', '.join(extras)} for configured features: {exc}")
         else:
             installed = set(extras) - declined_extras(project_root)
@@ -310,6 +319,9 @@ def _install_configured_features_missing_deps(project_root: Path) -> None:
         print("  ⚠ Configured features whose dependencies are still missing — the gateway will fail to load them on restart:")
         for feature, hint, _extra in missing:
             print(f"    - {feature}: {hint}")
+        if scope.mode == "default":
+            raise RuntimeError("Configured features whose dependencies are still missing: "
+                               + ", ".join(row[0] for row in missing))
 
 
 def _load_console_script_names() -> list[str]:

@@ -44,6 +44,7 @@ def complete_source_checkout(
     followups: list[tuple[str, str]] | None = None,
     after_dependencies=None,
     lock_wait: float = 0.0,
+    maintenance_scope=None,
 ) -> bool:
     """Publish commands, build the products, then run post-build maintenance.
 
@@ -61,6 +62,8 @@ def complete_source_checkout(
     from hermes_cli.update_lock import UpdateLock, describe_holder
 
     root = Path(root)
+    from hermes_cli.maintenance_scope import resolve_scope
+    scope = resolve_scope(root, maintenance_scope)
     # This tail is the last mutating step of an install or update, and its product
     # builds run for minutes. A gateway restarted while it runs (launchd KeepAlive,
     # a service manager, a second `hermes` launch) reaches the same tail through
@@ -84,7 +87,7 @@ def complete_source_checkout(
             pre_update_snapshot_id=pre_update_snapshot_id,
             pre_update_version=pre_update_version,
             completion_message=completion_message, announce=announce, followups=followups,
-            after_dependencies=after_dependencies,
+            after_dependencies=after_dependencies, maintenance_scope=scope,
         )
     finally:
         lock.release()
@@ -110,7 +113,19 @@ def _acquire_waiting(lock, wait: float) -> bool:
     return True
 
 
-def _complete_locked(
+def _complete_locked(root: Path, *, maintenance_scope, **options) -> bool:
+    from hermes_cli.maintenance_scope import maintenance_scope as bind_scope, record_scope, resolve_scope
+    from hermes_cli.venv_sync import arm_completion
+    # A preceding updater may have armed a narrower obligation after our first
+    # read but before this lock was acquired. Revalidate under checkout custody.
+    with bind_scope(resolve_scope(root, maintenance_scope)):
+        if maintenance_scope.mode == "default":
+            arm_completion(root, maintenance_scope=maintenance_scope)
+        record_scope()
+        return _complete_scoped(root, **options)
+
+
+def _complete_scoped(
     root: Path,
     *,
     desktop: bool,
@@ -125,6 +140,7 @@ def _complete_locked(
 ) -> bool:
     """The completion body; callers hold the update lock already."""
     from hermes_cli.source_build import build_update_products
+    from hermes_cli.maintenance_scope import ScopeSafetyRefusal
     from hermes_cli.update_cmd_maint import _run_post_update_maintenance
     from hermes_cli.venv_sync import publish_launchers
 
@@ -143,6 +159,8 @@ def _complete_locked(
         # config migration, the maintenance, or (in an update) the gateway restart after it.
         try:
             run()
+        except ScopeSafetyRefusal:
+            raise  # never continue maintenance after a loss of scope authority
         except (Exception, SystemExit) as exc:  # health: allow BLE001 -- reported as an owed follow-up
             from hermes_cli.update_receipt import record_followup
 
@@ -151,7 +169,10 @@ def _complete_locked(
             owed.append((name, reason))
 
     step("launchers", lambda: publish_launchers(root))
-    step("build", lambda: build_update_products(root, desktop=desktop, after_dependencies=after_dependencies))
+    from hermes_cli.maintenance_scope import current_scope
+    scope_options = {"maintenance_scope": current_scope()} if current_scope().mode == "default" else {}
+    step("build", lambda: build_update_products(root, desktop=desktop,
+                                                after_dependencies=after_dependencies, **scope_options))
     if announce:
         print(announce)
     verdict: list[bool] = []
@@ -162,7 +183,7 @@ def _complete_locked(
         had_desktop_app_before_update=desktop,
         pre_update_version=pre_update_version,
         completion_message=completion_message,
-        followups=owed,
+        followups=owed, **scope_options,
     )))
     tail_done = not owed
     if tail_done:
@@ -173,6 +194,11 @@ def _complete_locked(
         except (OSError, ValueError) as exc:
             print(f"⚠ Source update completed, but the install stamp could not be written: {exc}",
                   file=sys.stderr)
+    if tail_done:
+        from hermes_cli.maintenance_scope import current_scope
+        if current_scope().mode == "default":
+            from hermes_cli.venv_sync import clear_completion
+            clear_completion(root)
     if followups is not None:
         followups.extend(owed)
     # The SQLite verdict is not tail work (re-running the tail cannot fix the interpreter); it
@@ -200,12 +226,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--finish-update", action="store_true",
                         help="Complete a source UPDATE tail instead of an install: the "
                              "same launchers/products/maintenance with update wording.")
+    parser.add_argument("--maintenance-scope", choices=("all", "default"), default=None,
+                        help="Profile-data maintenance only; source and dependencies remain shared")
     args = parser.parse_args([argument for argument in argv if argument != _PREPARED])
     root = args.source.resolve()
     if not (root / "hermes_cli/source_completion.py").is_file():
         print(f"✗ {root} is not a Hermes source checkout", file=sys.stderr)
         return 1
 
+    from hermes_cli.maintenance_scope import resolve_scope
+    scope = resolve_scope(root, args.maintenance_scope)
     if prepared:
         # Dependencies are selected before any application import: this is the
         # same ordering the update completion guarantees.
@@ -223,12 +253,14 @@ def main(argv: list[str] | None = None) -> int:
             complete_source_checkout(
                 root, desktop=args.desktop, assume_yes=True,
                 completion_message=None, announce="\n✓ Code updated!", followups=owed,
+                maintenance_scope=scope,
             )
             ok = not owed
         else:
             ok = complete_source_checkout(
                 root, desktop=args.desktop, assume_yes=not args.interactive,
                 completion_message="✓ Install complete!", lock_wait=INSTALLER_LOCK_WAIT_SECONDS,
+                maintenance_scope=scope,
             )
         return 0 if ok else 1
 
@@ -239,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     # --finish-update here silently reports an update as an install.
     passthrough = (["--desktop"] if args.desktop else []) + \
                   (["--finish-update"] if args.finish_update else [])
-    command = _bootstrap_command(root, passthrough)
+    command = _bootstrap_command(root, passthrough + scope.cli_args())
     from hermes_cli.update_lock import checkout_lock_fds
 
     # Called inside an update tree (venv_sync's interrupted-update finish), the prepared child
