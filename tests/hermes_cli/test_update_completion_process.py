@@ -95,8 +95,18 @@ def transition(tmp_path):
         "    path = Path(os.environ['HERMES_HOME']) / 'completion-pending'\n"
         "    path.write_text('source update tail not finished\\n')\n"
         "    return path\n"
-        "def clear_completion(root):\n"
+        # The native keyword-only ``expected`` (update_completion's ``clear_completion(root,
+        # expected=current_scope())``): only a marker of that scope is cleared, read through the
+        # tree's real ``maintenance_scope.pending_scope``, as ``venv_sync.clear_completion`` does.
+        "def clear_completion(root, *, expected=None):\n"
+        "    from hermes_cli.maintenance_scope import pending_scope\n"
+        "    pending = pending_scope(root)\n"
+        "    event('clear', expected=None if expected is None else expected.mode,\n"
+        "          pending=None if pending is None else pending.mode)\n"
+        "    if expected is not None and pending is not None and pending != expected:\n"
+        "        return False\n"
         "    (Path(os.environ['HERMES_HOME']) / 'completion-pending').unlink()\n"
+        "    return True\n"
     )
     (package / "source_build.py").write_text(
         "from hermes_cli.probe import event\n"
@@ -263,6 +273,10 @@ def test_old_process_new_git_tree_completes_in_fresh_python(transition, tmp_path
     assert by_name["convert"]["pid"] == by_name["prepare"]["pid"] and names.index("convert") < names.index("tools")
     assert Path(by_name["build"]["python"]).is_relative_to(root.parent / "selected-python")
     assert by_name["build"]["pid"] == by_name["maintenance"]["pid"] == by_name["restart"]["pid"]
+    # The tail's own clear received the native scope and matched the armed marker (an error here
+    # would only have been a follow-up, still exit 0).
+    assert by_name["clear"]["pid"] == by_name["build"]["pid"]
+    assert by_name["clear"]["expected"] == by_name["clear"]["pending"] == "all"
     assert by_name["maintenance"]["snapshots"] == {"work": "work-before"}
     assert by_name["maintenance"]["pre_update_snapshot_id"] == "active-before"
     assert by_name["maintenance"]["pre_update_version"] == "日本 café"
