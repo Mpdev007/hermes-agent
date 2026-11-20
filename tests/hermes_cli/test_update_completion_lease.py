@@ -29,6 +29,7 @@ def _fake_windows_prepare(tmp_path, monkeypatch, acquire):
 
     events = []
     monkeypatch.setattr(update_completion, "sys", _Win32Sys())
+    monkeypatch.setattr(update_lock, "_HELD", None)  # the native join record a stand-in sets; restored afterwards
     monkeypatch.setattr(update_lock, "_acquire_checkout", lambda root: acquire(events, Path(root)))
     for name in ("arm_completion", "collect_superseded_generations"):
         monkeypatch.setattr(venv_sync, name, lambda root, _name=name: events.append(_name))
@@ -60,8 +61,23 @@ def test_windows_bootstrap_holds_a_checkout_lease_before_it_writes_the_checkout(
     """L3: a bootstrap child the job refused runs outside the kill-on-close job and outlives a
     killed owner; arm_completion, the sync's uv children and the generation collector must
     not run before it joined the checkout lock with a lease of its own (R5b)."""
-    root, events = _fake_windows_prepare(
-        tmp_path, monkeypatch, lambda events, root: events.append(("lease", root)))
+    from hermes_cli import update_lock
+
+    descriptors: list[int] = []
+
+    def personal_lease(events, root):
+        # The native Windows join with a lease byte of its own, recorded as _acquire_checkout records it
+        # (A7.5 counts a join only from that record). The stand-in descriptor is closed below.
+        descriptors.append(os.open(os.devnull, os.O_RDONLY))
+        update_lock._HELD = {"path": str(update_lock.checkout_lock_path(root)), "fd": None, "owned": False,
+                             "depth": 1, "lease": (descriptors[-1], update_lock._WINDOWS_LOCK_OFFSET + 1)}
+        events.append(("lease", root))
+
+    try:
+        root, events = _fake_windows_prepare(tmp_path, monkeypatch, personal_lease)
+    finally:
+        for fd in descriptors:
+            os.close(fd)
     assert events[0] == ("lease", root), events
     assert events[1:] == ["arm_completion", "tools", "sync_venv", "collect_superseded_generations",
                           "prepared"]

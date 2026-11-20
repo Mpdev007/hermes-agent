@@ -721,12 +721,51 @@ def main() -> int:
     from hermes_cli.maintenance_scope import resolve_scope
     resolve_scope(root, request.get("maintenance_scope"))
     if "--prepared" in sys.argv[3:]:
-        # Claim the selected generation's lease and process its .pth files only
-        # after PM selection, before importing any application dependencies.
-        from pm.environments import activate_dependencies
-        activate_dependencies(root)
-        return _finish(request, result_path)
+        return _prepared(request, result_path, root)
     return _bootstrap(request, request_path, result_path)
+
+
+def _prepared_custody(request: dict) -> str | None:
+    """None when this ``--prepared`` process holds the update's checkout with custody of its own, else why not.
+
+    A7.6 (Hermes af6219a7, prepared-child limit). The bootstrap starts this process directly and normally waits for
+    it, but on Windows passes it no checkout descriptor: if an uncontained bootstrap exits early, this process can
+    outlive the bootstrap's lease. So it joins the checkout itself (``_acquire_checkout``: on POSIX it finds the
+    descriptor the bootstrap passed, on Windows it takes a lease byte of its own, or the lock once free) and counts
+    only a join of its own (``_checkout_join == "own"``). The request's ``update_job`` record attests the bootstrap's
+    own job assignment, never this process, so it is not consulted. A join through the ancestor alone is released.
+    The join is never released here: it lasts through ``_finish``'s finalization, errors included, until this
+    process exits (native ``UpdateLock`` acquisitions only add depth to it).
+    """
+    from hermes_cli.update_lock import _acquire_checkout, _release_checkout
+
+    root = Path(request["source"])
+    try:
+        refused = _acquire_checkout(root)
+    except OSError as exc:
+        return f"the checkout lock could not be opened ({exc.strerror or type(exc).__name__})"
+    if refused is not None:
+        return refused.reason or f"held by process {refused.pid}"
+    if _checkout_join(root) == "own":
+        return None
+    _release_checkout()
+    return ("the prepared completion process joined the checkout only through its live update ancestor, with no "
+            "lock descriptor or lease of its own; the update's job record covers only its bootstrap")
+
+
+def _prepared(request: dict, result_path: Path, root: Path) -> int:
+    """The ``--prepared`` completion process: custody of its own first (A7.6), then dependency activation and the
+    tail. Without custody nothing is activated or written but the correlated private result: the update process,
+    which holds the checkout, settles it as a lost completion (``_report_without_custody``)."""
+    refused = _prepared_custody(request)
+    if refused is not None:
+        return _report_without_custody(request, result_path, "completion",
+                                       "the prepared completion process did not start its work", refused)
+    # Claim the selected generation's lease and process its .pth files only
+    # after PM selection, before importing any application dependencies.
+    from pm.environments import activate_dependencies
+    activate_dependencies(root)
+    return _finish(request, result_path)
 
 
 def _bootstrap(request: dict, request_path: Path, result_path: Path) -> int:

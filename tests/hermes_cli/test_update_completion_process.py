@@ -720,6 +720,140 @@ def test_the_parent_records_the_job_binding_only_after_binding_with_custody_of_i
     assert "update_job" not in request
 
 
+# ── A7.6 (Hermes af6219a7, prepared-child limit): the --prepared process needs custody of its own ──
+
+def _prepared_case(tmp_path, monkeypatch):
+    """``_custody_case`` plus tripwires on what the --prepared process does after its custody check: dependency
+    activation, the running-receipt persistence and the tail (``_finish``)."""
+    import pm.environments
+    from hermes_cli import update_receipt
+
+    source, home, request, writes = _custody_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(pm.environments, "activate_dependencies", lambda root: writes.append("activation"))
+    monkeypatch.setattr(update_receipt, "persist_running_receipt", lambda: writes.append("receipt persist"))
+    monkeypatch.setattr(update_completion, "_finish", lambda request, result_path: writes.append("tail") or 0)
+    return source, home, request, writes
+
+
+@pytest.mark.parametrize("outcome", ["ancestor", "ancestor-with-bootstrap-record", "refused", "unopenable"])
+def test_a_prepared_child_without_custody_of_its_own_activates_nothing_and_answers_its_parent(
+        tmp_path, monkeypatch, outcome):
+    """No dependency activation, no stage or receipt write, no tail: only the correlated private answer, which the
+    update process settles as a lost completion. The bootstrap's ``update_job`` record in the shared request never
+    covers this process (red on A7.5: the prepared entry activated and ran ``_finish`` with no join at all)."""
+    from hermes_cli import update_lock
+
+    source, home, request, writes = _prepared_case(tmp_path, monkeypatch)
+    if outcome == "ancestor-with-bootstrap-record":
+        request["update_job"] = "bound"
+
+    def native_join(root):
+        if outcome == "refused":
+            return update_lock.UpdateHolder(pid=4242, age_seconds=0.0)
+        if outcome == "unopenable":
+            raise PermissionError(13, "Permission denied")
+        _join_state(monkeypatch, source, "ancestor")
+        return None
+    monkeypatch.setattr(update_lock, "_acquire_checkout", native_join)
+    result_path = tmp_path / "result.json"
+    assert update_completion._prepared(request, result_path, source) == 1
+    assert writes == [] and not (home / ".update_exit_code").exists()
+    assert update_lock._HELD is None  # a join through the ancestor alone is released, not kept
+    answer = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert answer["update_id"] == request["receipt"]["update_id"]
+    assert answer["exit_code"] == 1 and answer["receipt"] is None and answer["windows_resume"] is None
+    assert "completion owed" in answer["error"] and "could not hold the update's checkout" in answer["error"]
+
+
+@pytest.mark.platforms("posix")
+def test_a_prepared_child_refused_by_a_competing_owner_activates_nothing(tmp_path, monkeypatch):
+    """Explicit refusal through the real native join: no descriptor was passed and another open file description
+    holds the checkout lock, so the prepared process reports privately and the competitor's hold is untouched."""
+    import fcntl
+
+    from hermes_cli import update_lock
+
+    source, home, request, writes = _prepared_case(tmp_path, monkeypatch)
+    lock_path = update_lock.checkout_lock_path(source)
+    lock_path.write_bytes(b'{"pid": 4242, "competing": "owner"}\n')
+    competitor = os.open(lock_path, os.O_RDWR)  # not inheritable (PEP 446): never mistaken for a passed fd
+    fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    result_path = tmp_path / "result.json"
+    try:
+        assert update_completion._prepared(request, result_path, source) == 1
+        assert writes == [] and update_lock._HELD is None
+    finally:
+        os.close(competitor)
+    answer = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert answer["exit_code"] == 1 and answer["receipt"] is None
+
+
+@pytest.mark.parametrize("kind", ["lease", "owned"])
+@pytest.mark.parametrize("tail", ["completes", "raises"])
+def test_a_prepared_child_with_custody_of_its_own_holds_it_through_finalization(tmp_path, monkeypatch, kind, tail):
+    """Positive controls: a lease byte or descriptor of its own is joined before dependency activation and is still
+    held when the tail finalizes, and after it, also when the tail raises (the kernel drops it at exit)."""
+    import pm.environments
+    from hermes_cli import update_lock
+
+    source, _home, request, _writes = _prepared_case(tmp_path, monkeypatch)
+    events: list = []
+    descriptors: list[int | None] = []
+
+    def native_join(root):
+        events.append("join")
+        descriptors.append(_join_state(monkeypatch, source, kind))
+        return None
+
+    def finish(request, result_path):
+        events.append(("tail", update_completion._checkout_join(source)))
+        if tail == "raises":
+            raise RuntimeError("the tail failed")
+        return 0
+    monkeypatch.setattr(update_lock, "_acquire_checkout", native_join)
+    monkeypatch.setattr(pm.environments, "activate_dependencies",
+                        lambda root: events.append(("activation", update_completion._checkout_join(source))))
+    monkeypatch.setattr(update_completion, "_finish", finish)
+    try:
+        if tail == "raises":
+            with pytest.raises(RuntimeError, match="the tail failed"):
+                update_completion._prepared(request, tmp_path / "result.json", source)
+        else:
+            assert update_completion._prepared(request, tmp_path / "result.json", source) == 0
+        assert events == ["join", ("activation", "own"), ("tail", "own")]
+        assert update_completion._checkout_join(source) == "own"
+    finally:
+        _close(*descriptors)
+
+
+@pytest.mark.platforms("posix")
+def test_a_prepared_child_joins_the_descriptor_its_bootstrap_passed(tmp_path, monkeypatch):
+    """Live POSIX control through the real native join: the locked descriptor the bootstrap passes
+    (``checkout_lock_fds``, inheritable after ``pass_fds``) is this process's own custody, and the tail's own
+    native acquisition (``complete_source_checkout``: ``UpdateLock(install_root=source)``, the request's spelling)
+    nests in it and gives it back, so the join is still held, at depth 1, for finalization."""
+    import fcntl
+
+    from hermes_cli import update_lock
+
+    source, _home, request, _writes = _prepared_case(tmp_path, monkeypatch)
+    lock_path = update_lock.checkout_lock_path(source)
+    passed = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(passed, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.set_inheritable(passed, True)
+        assert update_completion._prepared_custody(request) is None
+        assert update_lock._HELD["fd"] == passed and update_lock._HELD["owned"] is False
+        assert update_completion._checkout_join(source) == "own"
+        tail = update_lock.UpdateLock(install_root=Path(request["source"]))
+        assert tail.acquire_checkout(tail.install_root) and update_lock._HELD["depth"] == 2
+        tail.release()
+        assert update_lock._HELD["depth"] == 1 and update_lock._HELD["fd"] == passed
+        assert update_completion._checkout_join(source) == "own"
+    finally:
+        os.close(passed)
+
+
 @pytest.mark.parametrize("cleanup_failure", [None, "kill", "wait"])
 def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transition, monkeypatch, cleanup_failure):
     import io
