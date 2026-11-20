@@ -12,9 +12,12 @@ or claiming a bootstrap job record attests its prepared child.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import subprocess
+from contextlib import contextmanager
+from ctypes import wintypes
 from pathlib import Path
 
 import psutil
@@ -76,6 +79,49 @@ def _identity(pid: int) -> psutil.Process:
     proc = psutil.Process(pid)
     proc.create_time()
     return proc
+
+
+@contextmanager
+def _worker_exit(proc: psutil.Process, private: Path):
+    # Same native wait/query pattern as this lane's crash cells. Open while the observed
+    # worker is parked: psutil.wait can lose a non-child's code if it opens after exit.
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    api.OpenProcess.restype = wintypes.HANDLE
+    api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    api.WaitForSingleObject.restype = wintypes.DWORD
+    api.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    api.GetExitCodeProcess.restype = wintypes.BOOL
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE; no termination or elevated access.
+    handle = api.OpenProcess(0x1000 | 0x00100000, False, proc.pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # The handle pins this PID; psutil checks its cached creation identity while live.
+        assert proc.is_running(), "the observed prepared worker exited or its PID was reused"
+        state = api.WaitForSingleObject(handle, 0)
+        if state == 0xFFFFFFFF:  # WAIT_FAILED
+            raise ctypes.WinError(ctypes.get_last_error())
+        assert state == 0x102, f"prepared worker was not parked before signaling: {state}"  # WAIT_TIMEOUT
+
+        def wait(timeout: float) -> int:
+            state = api.WaitForSingleObject(handle, int(timeout * 1000))
+            if state == 0xFFFFFFFF:
+                raise ctypes.WinError(ctypes.get_last_error())
+            assert state == 0, f"prepared worker did not exit within {timeout}s: {state}"  # WAIT_OBJECT_0
+            code = wintypes.DWORD()
+            if not api.GetExitCodeProcess(handle, ctypes.byref(code)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            (private / "worker-exit.json").write_text(json.dumps(dict(
+                pid=proc.pid, create_time=proc.create_time(), exit_code=code.value)), encoding="utf-8")
+            return code.value
+
+        yield wait
+    finally:
+        if not api.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _under(proc: psutil.Process, pid: int) -> bool:
@@ -200,11 +246,16 @@ def test_prepared_survivor_keeps_its_lease_through_the_result_and_releases_at_ex
         assert answer["exit_code"] == 0 and answer["receipt"]["outcome"] == "success", answer
         assert any(s["name"] == "deps" and s["outcome"] == "success" for s in answer["receipt"]["stages"])
         if cell == "tail-error":
-            assert any("fixture_prepared_tail_error" in f["reason"]
+            assert any(f["step"] == "completion" and "fixture_prepared_tail_error" in f["reason"]
                        for f in answer["receipt"]["followups"]), answer
+        else:
+            assert any(s["name"] == "build" and s["outcome"] == "success"
+                       for s in answer["receipt"]["stages"]), answer
+            assert not any(f["step"] == "completion" for f in answer["receipt"]["followups"]), answer
         _contend(machine, python, private, cell, acquired=False)
-        _signal(private, "prepared-exit")
-        assert prepared.wait(timeout=30) == answer["exit_code"]
+        with _worker_exit(prepared, private) as wait:
+            _signal(private, "prepared-exit")
+            assert wait(30) == answer["exit_code"], answer
         _contend(machine, python, private, cell, acquired=True)
     finally:
         machine.kill_owned()
@@ -231,8 +282,9 @@ def test_exhausted_native_leases_refuse_prepared_before_activation_or_shared_wri
         assert answer["schema"] == 1 and answer["update_id"] == request["receipt"]["update_id"]
         assert answer["exit_code"] == 1 and answer["receipt"] is None and answer["windows_resume"] is None
         assert "no lock descriptor or lease of its own" in answer["error"], answer
-        _signal(private, "prepared-exit")
-        assert prepared.wait(timeout=30) == 1
+        with _worker_exit(prepared, private) as wait:
+            _signal(private, "prepared-exit")
+            assert wait(30) == 1, answer
         events = _events(private, "prepared")
         assert any(e["event"] == "lock-open" for e in events), events
         assert not [e for e in events if e["event"] in ("activation", "forbidden-write", "forbidden-process")], events
